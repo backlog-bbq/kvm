@@ -206,22 +206,27 @@ func (s *Server) UnpairClient(uniqueID string) error {
 // that if Phase 2 has already arrived (blocking) it can proceed, and if
 // Phase 2 arrives later (client retry) it finds the key pre-computed.
 func (s *Server) SubmitPIN(uniqueID, pin string) error {
+	log.Info().Str("uniqueID", uniqueID).Str("pin", pin).Msg("SubmitPIN called")
+
 	activePairingsMu.Lock()
 	state, ok := activePairings[uniqueID]
 	activePairingsMu.Unlock()
 	if !ok {
-		return fmt.Errorf("no pending Moonlight pairing for uniqueID %q", uniqueID)
+		log.Warn().Str("uniqueID", uniqueID).Msg("SubmitPIN: no pending pairing state found")
+		return fmt.Errorf("no pending Moonlight pairing for uniqueID %q — start pairing from your Moonlight client first", uniqueID)
 	}
 
 	// Store PIN and pre-derive AES key so Phase 2 can use it immediately.
 	state.pin = pin
 	state.aesKey = pairingAESKey(pin, state.salt)
-	log.Info().Str("uniqueID", uniqueID).Msg("PIN submitted — AES key derived")
+	log.Info().Str("uniqueID", uniqueID).Msg("SubmitPIN: AES key derived, delivering to Phase 1")
 
-	// Also deliver via channel in case Phase 2 is already blocking.
+	// Deliver via channel — Phase 1 is blocking on this.
 	select {
 	case state.pinCh <- pin:
+		log.Info().Str("uniqueID", uniqueID).Msg("SubmitPIN: PIN delivered to pinCh")
 	default:
+		log.Info().Str("uniqueID", uniqueID).Msg("SubmitPIN: pinCh full (Phase 1 not waiting yet), PIN stored for later")
 	}
 	return nil
 }
