@@ -368,6 +368,7 @@ func (s *Server) handlePairClientChallenge(w http.ResponseWriter, r *http.Reques
 				Msg("phase2: PIN received, AES key derived")
 		case <-r.Context().Done():
 			log.Debug().Str("uniqueID", uniqueID).Msg("phase2: client disconnected while waiting for PIN — state preserved for retry")
+			xmlError(w, 400, "PIN not yet entered — pair again after entering PIN")
 			return
 		case <-time.After(120 * time.Second):
 			log.Warn().Str("uniqueID", uniqueID).Msg("phase2: timed out waiting for PIN")
@@ -437,7 +438,7 @@ func (s *Server) handlePairClientChallenge(w http.ResponseWriter, r *http.Reques
 		Str("encryptedHex", hex.EncodeToString(encrypted)).
 		Msg("phase2 complete: returning encrypted server challenge+response")
 
-	xmlOK(w, fmt.Sprintf(`<paired>1</paired><challenge>%s</challenge>`,
+	xmlOK(w, fmt.Sprintf(`<paired>1</paired><challengeresponse>%s</challengeresponse>`,
 		hex.EncodeToString(encrypted)))
 }
 
