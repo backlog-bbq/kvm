@@ -85,6 +85,44 @@ func rpcSubmitMoonlightPIN(uniqueID, pin string) error {
 	return moonlightServer.SubmitPIN(uniqueID, pin)
 }
 
+// MoonlightStateResult is returned by rpcGetMoonlightState.
+type MoonlightStateResult struct {
+	Enabled       bool     `json:"enabled"`
+	PairedClients []string `json:"pairedClients"`
+}
+
+// rpcGetMoonlightState returns the current Moonlight configuration and the
+// list of paired client unique IDs.
+func rpcGetMoonlightState() (*MoonlightStateResult, error) {
+	var clients []string
+	if moonlightServer != nil {
+		clients = moonlightServer.GetPairedClientIDs()
+	}
+	if clients == nil {
+		clients = []string{}
+	}
+	return &MoonlightStateResult{
+		Enabled:       config.MoonlightEnabled,
+		PairedClients: clients,
+	}, nil
+}
+
+// rpcSetMoonlightEnabled enables or disables the Moonlight server.
+// The change is persisted to config; a device restart is required for it to
+// take effect when transitioning from disabled → enabled.
+func rpcSetMoonlightEnabled(enabled bool) error {
+	config.MoonlightEnabled = enabled
+	return SaveConfig()
+}
+
+// rpcUnpairMoonlightClient removes a paired Moonlight client.
+func rpcUnpairMoonlightClient(uniqueID string) error {
+	if moonlightServer == nil {
+		return fmt.Errorf("Moonlight server is not running")
+	}
+	return moonlightServer.UnpairClient(uniqueID)
+}
+
 // getMACAddress returns the MAC address of the primary network interface (eth0)
 // formatted as XX:XX:XX:XX:XX:XX, or a placeholder if unavailable.
 func getMACAddress() string {

@@ -188,6 +188,17 @@ func (s *PairingStore) StorePairedClient(uniqueID, certPEM string) error {
 	return s.Save()
 }
 
+// GetPairedClientIDs returns a snapshot of the uniqueIDs of all paired clients.
+func (s *PairingStore) GetPairedClientIDs() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ids := make([]string, 0, len(s.PairedClients))
+	for id := range s.PairedClients {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
 // RemovePairedClient removes a paired client.
 func (s *PairingStore) RemovePairedClient(uniqueID string) error {
 	s.mu.Lock()

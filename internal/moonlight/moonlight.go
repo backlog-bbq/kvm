@@ -191,6 +191,16 @@ func (s *Server) clearSession() {
 	}
 }
 
+// GetPairedClientIDs returns the uniqueIDs of all paired Moonlight clients.
+func (s *Server) GetPairedClientIDs() []string {
+	return s.store.GetPairedClientIDs()
+}
+
+// UnpairClient removes a paired client by its uniqueID.
+func (s *Server) UnpairClient(uniqueID string) error {
+	return s.store.RemovePairedClient(uniqueID)
+}
+
 // SubmitPIN delivers a PIN entered by the user to the pending pairing
 // handshake identified by uniqueID. It returns an error if there is no
 // pending pairing for that uniqueID or if the channel has already been fed.

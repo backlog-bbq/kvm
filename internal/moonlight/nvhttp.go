@@ -52,16 +52,32 @@ func xmlEsc(s string) string {
 // ── HTTP / HTTPS server setup ─────────────────────────────────────────────────
 
 // nvhttpMux builds the shared ServeMux with all NVHTTP endpoints.
+// Every request is logged at Debug level by the loggingMiddleware wrapper.
 func (s *Server) nvhttpMux() *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/serverinfo", s.handleServerInfo)
-	mux.HandleFunc("/pair", s.handlePair)
-	mux.HandleFunc("/applist", s.handleAppList)
-	mux.HandleFunc("/launch", s.handleLaunch)
-	mux.HandleFunc("/resume", s.handleResume)
-	mux.HandleFunc("/cancel", s.handleCancel)
-	mux.HandleFunc("/unpair", s.handleUnpair)
+	mux.HandleFunc("/serverinfo", s.nvhttpLog(s.handleServerInfo))
+	mux.HandleFunc("/pair", s.nvhttpLog(s.handlePair))
+	mux.HandleFunc("/applist", s.nvhttpLog(s.handleAppList))
+	mux.HandleFunc("/launch", s.nvhttpLog(s.handleLaunch))
+	mux.HandleFunc("/resume", s.nvhttpLog(s.handleResume))
+	mux.HandleFunc("/cancel", s.nvhttpLog(s.handleCancel))
+	mux.HandleFunc("/unpair", s.nvhttpLog(s.handleUnpair))
 	return mux
+}
+
+// nvhttpLog wraps a handler to log every incoming NVHTTP request with its full
+// URL (including query string) so that protocol issues are immediately visible.
+func (s *Server) nvhttpLog(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		log.Debug().
+			Str("method", r.Method).
+			Str("path", r.URL.Path).
+			Str("query", r.URL.RawQuery).
+			Bool("tls", r.TLS != nil).
+			Str("remote", r.RemoteAddr).
+			Msg("NVHTTP request")
+		h(w, r)
+	}
 }
 
 // runNVHTTPServer starts the unencrypted discovery server on port 47989.
@@ -171,17 +187,26 @@ func (s *Server) handleServerInfo(w http.ResponseWriter, r *http.Request) {
 
 // handlePair is the entry point for all four pairing phases.
 //
+// Moonlight uses the query parameter "phrase" (not "phase") for the phase name.
+// We accept both spellings for compatibility with all client versions.
+//
 // Pairing uses a mutual-authentication challenge-response protocol based on a
 // shared 4-digit PIN. Protocol overview (all AES uses CBC mode, zero IV):
 //
-//	Phase 1  getservercert        – server returns its X.509 cert; PIN is generated
+//	Phase 1  getservercert        – client sends its cert + salt; server returns its cert
 //	Phase 2  clientchallenge      – client proves PIN knowledge; server returns challenge
 //	Phase 3  serverchallengeresp  – client proves cert ownership; server returns signed secret
 //	Phase 4  clientpairingsecret  – client delivers its cert; server verifies and stores it
 func (s *Server) handlePair(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	uniqueID := q.Get("uniqueid")
-	phase := q.Get("phase")
+
+	// Moonlight sends "phrase"; some other implementations send "phase".
+	// Accept both.
+	phase := q.Get("phrase")
+	if phase == "" {
+		phase = q.Get("phase")
+	}
 
 	if uniqueID == "" {
 		log.Warn().Str("remote", r.RemoteAddr).Msg("/pair: missing uniqueid")
@@ -193,8 +218,14 @@ func (s *Server) handlePair(w http.ResponseWriter, r *http.Request) {
 		Str("remote", r.RemoteAddr).
 		Bool("tls", r.TLS != nil).
 		Str("uniqueID", uniqueID).
-		Str("phase", phase).
-		Msg("/pair request received")
+		Str("phrase", phase).
+		Str("devicename", q.Get("devicename")).
+		Bool("hasSalt", q.Get("salt") != "").
+		Bool("hasClientCert", q.Get("clientcert") != "").
+		Bool("hasClientChallenge", q.Get("clientchallenge") != "").
+		Bool("hasServerChallengeResp", q.Get("serverchallengeresp") != "").
+		Bool("hasClientPairingSecret", q.Get("clientpairingsecret") != "").
+		Msg("/pair: dispatching pairing phase")
 
 	switch phase {
 	case "getservercert":
@@ -207,8 +238,12 @@ func (s *Server) handlePair(w http.ResponseWriter, r *http.Request) {
 	case "clientpairingsecret":
 		s.handlePairClientPairingSecret(w, uniqueID, q.Get("clientpairingsecret"))
 	default:
-		log.Warn().Str("phase", phase).Msg("/pair: unknown phase")
-		xmlError(w, 400, fmt.Sprintf("unknown pairing phase: %s", phase))
+		log.Warn().
+			Str("phrase", phase).
+			Str("uniqueID", uniqueID).
+			Str("rawQuery", r.URL.RawQuery).
+			Msg("/pair: unknown or missing phrase parameter — Moonlight uses 'phrase', not 'phase'")
+		xmlError(w, 400, fmt.Sprintf("unknown pairing phrase: %q", phase))
 	}
 }
 
@@ -252,8 +287,9 @@ func (s *Server) handlePairGetServerCert(w http.ResponseWriter, uniqueID, device
 		Str("uniqueID", uniqueID).
 		Str("deviceName", deviceName).
 		Bool("hasSalt", len(salt) > 0).
+		Str("saltHex", hex.EncodeToString(salt)).
 		Int("certPEMLen", len(certPEM)).
-		Msg("phase1 complete: waiting for user PIN input, returning server cert")
+		Msg("phase1 complete: PIN entry required from user — server cert returned to client")
 
 	xmlOK(w, fmt.Sprintf(`<paired>0</paired><plaincert>%s</plaincert>`, certPEM))
 }
@@ -291,6 +327,7 @@ func (s *Server) handlePairClientChallenge(w http.ResponseWriter, uniqueID, chal
 		log.Info().
 			Str("uniqueID", uniqueID).
 			Bool("hasSalt", len(state.salt) > 0).
+			Str("aesKeyHex", hex.EncodeToString(state.aesKey)).
 			Msg("phase2: PIN received, AES key derived")
 	case <-time.After(120 * time.Second):
 		log.Warn().Str("uniqueID", uniqueID).Msg("phase2: timed out waiting for PIN")
@@ -308,12 +345,21 @@ func (s *Server) handlePairClientChallenge(w http.ResponseWriter, uniqueID, chal
 		return
 	}
 
+	log.Debug().
+		Str("uniqueID", uniqueID).
+		Str("challengeEncHex", hex.EncodeToString(challengeEnc)).
+		Msg("phase2: decrypting client challenge")
+
 	clientData, err := aes128CBCDecrypt(state.aesKey, challengeEnc)
 	if err != nil {
-		log.Warn().Err(err).Str("uniqueID", uniqueID).Msg("phase2: AES-CBC decrypt failed (wrong PIN?)")
+		log.Warn().Err(err).Str("uniqueID", uniqueID).Msg("phase2: AES-CBC decrypt failed — wrong PIN or salt mismatch")
 		xmlError(w, 500, "failed to decrypt client challenge")
 		return
 	}
+	log.Debug().
+		Str("uniqueID", uniqueID).
+		Str("clientDataHex", hex.EncodeToString(clientData)).
+		Msg("phase2: client challenge decrypted")
 
 	serverChallenge := make([]byte, 16)
 	if _, err := rand.Read(serverChallenge); err != nil {
@@ -347,7 +393,9 @@ func (s *Server) handlePairClientChallenge(w http.ResponseWriter, uniqueID, chal
 	log.Info().
 		Str("uniqueID", uniqueID).
 		Str("serverResponseHex", hex.EncodeToString(serverResponse)).
-		Msg("phase2 complete: returning server challenge")
+		Str("serverChallengeHex", hex.EncodeToString(serverChallenge)).
+		Str("encryptedHex", hex.EncodeToString(encrypted)).
+		Msg("phase2 complete: returning encrypted server challenge+response")
 
 	xmlOK(w, fmt.Sprintf(`<paired>0</paired><challenge>%s</challenge>`,
 		hex.EncodeToString(encrypted)))
@@ -390,9 +438,14 @@ func (s *Server) handlePairServerChallengeResp(w http.ResponseWriter, uniqueID, 
 	}
 
 	// Decrypt: result should be SHA256(serverResponse ‖ clientCert.Signature).
+	log.Debug().
+		Str("uniqueID", uniqueID).
+		Str("respEncHex", hex.EncodeToString(respEnc)).
+		Msg("phase3: decrypting serverchallengeresp")
+
 	clientHash, err := aes128CBCDecrypt(state.aesKey, respEnc)
 	if err != nil {
-		log.Warn().Err(err).Str("uniqueID", uniqueID).Msg("phase3: AES-CBC decrypt failed (wrong PIN?)")
+		log.Warn().Err(err).Str("uniqueID", uniqueID).Msg("phase3: AES-CBC decrypt failed — wrong PIN or salt mismatch")
 		xmlError(w, 500, "failed to decrypt serverchallengeresp")
 		return
 	}
@@ -402,7 +455,7 @@ func (s *Server) handlePairServerChallengeResp(w http.ResponseWriter, uniqueID, 
 	log.Debug().
 		Str("uniqueID", uniqueID).
 		Str("clientHashHex", hex.EncodeToString(clientHash)).
-		Msg("phase3: stored client challenge hash")
+		Msg("phase3: stored client challenge hash (will verify in phase 4)")
 
 	// Compute and return our signed secret so the client can verify us:
 	// serverSecret = RSA_sign_SHA256(clientHash ‖ serverCert.Signature, serverKey)
@@ -445,7 +498,7 @@ func (s *Server) handlePairClientPairingSecret(w http.ResponseWriter, uniqueID, 
 	log.Debug().
 		Str("uniqueID", uniqueID).
 		Int("secretHexLen", len(clientPairingSecretHex)).
-		Msg("phase4: received clientpairingsecret (client cert)")
+		Msg("phase4: received clientpairingsecret")
 
 	clientCertBytes, err := hexDecode(clientPairingSecretHex)
 	if err != nil {
@@ -453,6 +506,11 @@ func (s *Server) handlePairClientPairingSecret(w http.ResponseWriter, uniqueID, 
 		xmlError(w, 400, "invalid clientpairingsecret hex")
 		return
 	}
+	log.Debug().
+		Str("uniqueID", uniqueID).
+		Int("clientCertLen", len(clientCertBytes)).
+		Str("clientCertPrefix", fmt.Sprintf("% x", clientCertBytes[:min(16, len(clientCertBytes))])).
+		Msg("phase4: decoded client cert bytes")
 	state.clientCertPEM = string(clientCertBytes)
 
 	// Verify the phase-3 challenge hash now that we have the client cert signature.
@@ -461,7 +519,7 @@ func (s *Server) handlePairClientPairingSecret(w http.ResponseWriter, uniqueID, 
 		clientSig, parseErr := extractCertSignature(clientCertBytes)
 		if parseErr != nil {
 			log.Warn().Err(parseErr).Str("uniqueID", uniqueID).
-				Msg("phase4: could not parse client cert to verify challenge hash; accepting anyway")
+				Msg("phase4: could not parse client cert signature — accepting anyway")
 		} else {
 			expected := sha256.Sum256(append(append([]byte(nil), state.serverResponse...), clientSig...))
 			if len(state.clientChallengeHash) >= 32 {
@@ -563,6 +621,14 @@ func getOutboundIP() string {
 	}
 	defer conn.Close()
 	return conn.LocalAddr().(*net.UDPAddr).IP.String()
+}
+
+// min returns the smaller of a and b. Provided for compatibility with Go < 1.21.
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // extractCertSignature parses a DER- or PEM-encoded certificate and returns
