@@ -115,6 +115,10 @@ func Main() {
 	}
 	initJiggler()
 
+	// Initialize Moonlight streaming server (if enabled in config).
+	setProcTitle("initMoonlight")
+	initMoonlight()
+
 	// start video sleep mode timer
 	startVideoSleepModeTicker()
 

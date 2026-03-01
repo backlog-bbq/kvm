@@ -68,11 +68,16 @@ func initNative(systemVersion *semver.Version, appVersion *semver.Version) {
 			}
 		},
 		OnVideoFrameReceived: func(frame []byte, duration time.Duration) {
+			// WebRTC session sink.
 			if currentSession != nil {
 				err := currentSession.VideoTrack.WriteSample(media.Sample{Data: frame, Duration: duration})
 				if err != nil {
 					nativeLogger.Warn().Err(err).Msg("error writing sample")
 				}
+			}
+			// Moonlight session sink (non-blocking; drops frame when server is idle).
+			if moonlightServer != nil {
+				moonlightServer.WriteVideoFrame(frame, duration)
 			}
 		},
 		GetSessionInfo: func() diagnostics.SessionInfo {
