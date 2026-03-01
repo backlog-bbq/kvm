@@ -202,8 +202,9 @@ func (s *Server) UnpairClient(uniqueID string) error {
 }
 
 // SubmitPIN delivers a PIN entered by the user to the pending pairing
-// handshake identified by uniqueID. It returns an error if there is no
-// pending pairing for that uniqueID or if the channel has already been fed.
+// handshake identified by uniqueID. The AES key is derived immediately so
+// that if Phase 2 has already arrived (blocking) it can proceed, and if
+// Phase 2 arrives later (client retry) it finds the key pre-computed.
 func (s *Server) SubmitPIN(uniqueID, pin string) error {
 	activePairingsMu.Lock()
 	state, ok := activePairings[uniqueID]
@@ -211,13 +212,18 @@ func (s *Server) SubmitPIN(uniqueID, pin string) error {
 	if !ok {
 		return fmt.Errorf("no pending Moonlight pairing for uniqueID %q", uniqueID)
 	}
+
+	// Store PIN and pre-derive AES key so Phase 2 can use it immediately.
+	state.pin = pin
+	state.aesKey = pairingAESKey(pin, state.salt)
+	log.Info().Str("uniqueID", uniqueID).Msg("PIN submitted — AES key derived")
+
+	// Also deliver via channel in case Phase 2 is already blocking.
 	select {
 	case state.pinCh <- pin:
-		log.Info().Str("uniqueID", uniqueID).Msg("PIN submitted to pairing state")
-		return nil
 	default:
-		return fmt.Errorf("pairing for uniqueID %q is not waiting for a PIN", uniqueID)
 	}
+	return nil
 }
 
 // getSession returns the current active session (nil if none).

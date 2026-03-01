@@ -233,7 +233,7 @@ func (s *Server) handlePair(w http.ResponseWriter, r *http.Request) {
 	case "getservercert":
 		s.handlePairGetServerCert(w, uniqueID, q.Get("devicename"), q.Get("salt"), q.Get("clientcert"))
 	case "clientchallenge":
-		s.handlePairClientChallenge(w, uniqueID, q.Get("clientchallenge"))
+		s.handlePairClientChallenge(w, r, uniqueID, q.Get("clientchallenge"))
 	case "serverchallengeresp":
 		s.handlePairServerChallengeResp(w, uniqueID,
 			q.Get("serverchallengeresp"), q.Get("clientpairingsecret"))
@@ -286,7 +286,14 @@ func (s *Server) handlePairGetServerCert(w http.ResponseWriter, uniqueID, device
 		}
 	}
 
+	// If the user already entered a PIN in a previous (timed-out) attempt,
+	// carry it forward and re-derive the AES key with the new salt.
 	activePairingsMu.Lock()
+	if prev, exists := activePairings[uniqueID]; exists && prev.pin != "" {
+		state.pin = prev.pin
+		state.aesKey = pairingAESKey(prev.pin, salt)
+		log.Info().Str("uniqueID", uniqueID).Msg("phase1: reusing PIN from previous attempt")
+	}
 	activePairings[uniqueID] = state
 	activePairingsMu.Unlock()
 
@@ -331,7 +338,7 @@ func (s *Server) handlePairGetServerCert(w http.ResponseWriter, uniqueID, device
 //
 //	serverResponse (32) = SHA256(clientData ‖ serverCert.Signature ‖ serverChallenge)
 //	serverChallenge (16)
-func (s *Server) handlePairClientChallenge(w http.ResponseWriter, uniqueID, challengeHex string) {
+func (s *Server) handlePairClientChallenge(w http.ResponseWriter, r *http.Request, uniqueID, challengeHex string) {
 	activePairingsMu.Lock()
 	state, ok := activePairings[uniqueID]
 	activePairingsMu.Unlock()
@@ -344,24 +351,31 @@ func (s *Server) handlePairClientChallenge(w http.ResponseWriter, uniqueID, chal
 	log.Debug().
 		Str("uniqueID", uniqueID).
 		Int("challengeHexLen", len(challengeHex)).
-		Msg("phase2: waiting for user PIN input")
+		Bool("hasAESKey", state.aesKey != nil).
+		Msg("phase2: processing client challenge")
 
-	// Block until the user submits the PIN via the JetKVM UI (or timeout).
-	select {
-	case pin := <-state.pinCh:
-		state.aesKey = pairingAESKey(pin, state.salt)
-		log.Info().
-			Str("uniqueID", uniqueID).
-			Bool("hasSalt", len(state.salt) > 0).
-			Str("aesKeyHex", hex.EncodeToString(state.aesKey)).
-			Msg("phase2: PIN received, AES key derived")
-	case <-time.After(120 * time.Second):
-		log.Warn().Str("uniqueID", uniqueID).Msg("phase2: timed out waiting for PIN")
-		activePairingsMu.Lock()
-		delete(activePairings, uniqueID)
-		activePairingsMu.Unlock()
-		xmlError(w, 408, "timed out waiting for PIN entry")
-		return
+	// If the user already submitted the PIN (via the settings page), the AES
+	// key is pre-derived and we can respond immediately. Otherwise block
+	// until the PIN arrives or the request is cancelled by the client.
+	if state.aesKey == nil {
+		log.Info().Str("uniqueID", uniqueID).Msg("phase2: waiting for user PIN input")
+		select {
+		case pin := <-state.pinCh:
+			state.aesKey = pairingAESKey(pin, state.salt)
+			log.Info().
+				Str("uniqueID", uniqueID).
+				Bool("hasSalt", len(state.salt) > 0).
+				Msg("phase2: PIN received, AES key derived")
+		case <-r.Context().Done():
+			log.Debug().Str("uniqueID", uniqueID).Msg("phase2: client disconnected while waiting for PIN — state preserved for retry")
+			return
+		case <-time.After(120 * time.Second):
+			log.Warn().Str("uniqueID", uniqueID).Msg("phase2: timed out waiting for PIN")
+			xmlError(w, 408, "timed out waiting for PIN entry")
+			return
+		}
+	} else {
+		log.Info().Str("uniqueID", uniqueID).Msg("phase2: PIN already available, responding immediately")
 	}
 
 	challengeEnc, err := hexDecode(challengeHex)

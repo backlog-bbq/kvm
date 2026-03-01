@@ -212,6 +212,7 @@ type pairingState struct {
 	uniqueID   string
 	deviceName string
 	salt       []byte     // random bytes sent by the client in phase 1
+	pin        string     // PIN entered by user (persists across client retries)
 	pinCh      chan string // receives the PIN typed by the user in the JetKVM UI
 	aesKey     []byte     // SHA256(salt ‖ PIN)[0:16], set after PIN is known
 
