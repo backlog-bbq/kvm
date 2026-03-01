@@ -3,6 +3,7 @@ package kvm
 import (
 	"fmt"
 	"net"
+	"time"
 
 	"github.com/jetkvm/kvm/internal/moonlight"
 )
@@ -48,16 +49,32 @@ func initMoonlight() {
 			},
 		},
 		PINCallback: func(deviceName, uniqueID string) {
-			// Emit a JSON-RPC event so the web UI can prompt the user to type
-			// the PIN that is displayed on their Moonlight client.
-			writeJSONRPCEvent("moonlightPairingRequest", map[string]string{
-				"deviceName": deviceName,
-				"uniqueID":   uniqueID,
-			}, currentSession)
 			logger.Info().
 				Str("deviceName", deviceName).
 				Str("uniqueID", uniqueID).
 				Msg("Moonlight pairing requested: waiting for user to enter PIN from client")
+
+			// Emit a JSON-RPC event so the web UI can prompt the user to type
+			// the PIN that is displayed on their Moonlight client.
+			// currentSession may be nil if no browser has the web UI open yet,
+			// so retry periodically until the event is delivered or the pairing
+			// times out.
+			params := map[string]string{
+				"deviceName": deviceName,
+				"uniqueID":   uniqueID,
+			}
+			go func() {
+				for range 60 { // retry for up to ~120 s (60 × 2 s)
+					session := currentSession
+					if session != nil && session.RPCChannel != nil {
+						writeJSONRPCEvent("moonlightPairingRequest", params, session)
+						logger.Info().Msg("Moonlight pairing PIN prompt sent to web UI")
+						return
+					}
+					time.Sleep(2 * time.Second)
+				}
+				logger.Warn().Msg("Moonlight pairing: no web UI session available to deliver PIN prompt")
+			}()
 		},
 	})
 	if err != nil {

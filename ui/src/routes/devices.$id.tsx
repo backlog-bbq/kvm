@@ -40,7 +40,6 @@ import { useDeviceUiNavigation } from "@hooks/useAppNavigation";
 import { useVersion } from "@hooks/useVersion";
 import WebRTCVideo from "@components/WebRTCVideo";
 import DashboardNavbar from "@components/Header";
-import MoonlightPINDialog from "@components/MoonlightPINDialog";
 const ConnectionStatsSidebar = lazy(() => import("@components/sidebar/connectionStats"));
 const Terminal = lazy(() => import("@components/Terminal"));
 const UpdateInProgressStatusCard = lazy(() => import("@components/UpdateInProgressStatusCard"));
@@ -1020,7 +1019,6 @@ export default function KvmIdRoute() {
         <Terminal type="serial" dataChannel={serialConsole} title={m.serial_console()} />
       )}
 
-      <MoonlightPINDialog />
     </FeatureFlagProvider>
   );
 }
