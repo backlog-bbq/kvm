@@ -261,6 +261,11 @@ func (s *Server) handlePair(w http.ResponseWriter, r *http.Request) {
 			q.Get("serverchallengeresp"), q.Get("clientpairingsecret"))
 	case "clientpairingsecret":
 		s.handlePairClientPairingSecret(w, uniqueID, q.Get("clientpairingsecret"))
+	case "pairchallenge":
+		// Final verification ping after Phase 4. Sunshine returns paired=1
+		// with no additional data. Required for the client to confirm pairing.
+		log.Info().Str("uniqueID", uniqueID).Msg("pairchallenge: confirming pairing")
+		xmlOK(w, `<paired>1</paired>`)
 	default:
 		log.Warn().
 			Str("phrase", q.Get("phrase")).
