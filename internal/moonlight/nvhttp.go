@@ -14,7 +14,6 @@ import (
 	"net/http"
 	"strings"
 	"sync"
-	"time"
 )
 
 // activePairings holds in-progress pairing states keyed by uniqueID.
@@ -378,9 +377,9 @@ func (s *Server) handlePairGetServerCert(w http.ResponseWriter, uniqueID, device
 // ── Phase 2: clientchallenge ──────────────────────────────────────────────────
 
 // handlePairClientChallenge processes the client's AES-CBC encrypted random
-// challenge. The server first blocks (up to 120 s) waiting for the user to
-// enter the PIN shown on the Moonlight client. Once received, the AES key is
-// derived as SHA256(salt ‖ PIN)[0:16].
+// challenge. If the user has already submitted the PIN (via the settings page),
+// the AES key is pre-derived and we respond immediately. Otherwise we return
+// paired=0 so the client fails fast — the user can enter the PIN and retry.
 //
 // Server response plaintext (48 bytes):
 //
@@ -396,36 +395,22 @@ func (s *Server) handlePairClientChallenge(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	log.Debug().
+	log.Info().
 		Str("uniqueID", uniqueID).
 		Int("challengeHexLen", len(challengeHex)).
 		Bool("hasAESKey", state.aesKey != nil).
 		Msg("phase2: processing client challenge")
 
-	// If the user already submitted the PIN (via the settings page), the AES
-	// key is pre-derived and we can respond immediately. Otherwise block
-	// until the PIN arrives or the request is cancelled by the client.
+	// If the PIN hasn't been entered yet, fail fast. The Moonlight client
+	// has a ~5 s timeout so blocking is not viable. The user enters the PIN
+	// on the settings page and retries pairing — Phase 1 will carry the PIN
+	// forward and Phase 2 will respond immediately on the next attempt.
 	if state.aesKey == nil {
-		log.Info().Str("uniqueID", uniqueID).Msg("phase2: waiting for user PIN input")
-		select {
-		case pin := <-state.pinCh:
-			state.aesKey = pairingAESKey(pin, state.salt)
-			log.Info().
-				Str("uniqueID", uniqueID).
-				Bool("hasSalt", len(state.salt) > 0).
-				Msg("phase2: PIN received, AES key derived")
-		case <-r.Context().Done():
-			log.Debug().Str("uniqueID", uniqueID).Msg("phase2: client disconnected while waiting for PIN — state preserved for retry")
-			xmlError(w, 400, "PIN not yet entered — pair again after entering PIN")
-			return
-		case <-time.After(120 * time.Second):
-			log.Warn().Str("uniqueID", uniqueID).Msg("phase2: timed out waiting for PIN")
-			xmlError(w, 408, "timed out waiting for PIN entry")
-			return
-		}
-	} else {
-		log.Info().Str("uniqueID", uniqueID).Msg("phase2: PIN already available, responding immediately")
+		log.Info().Str("uniqueID", uniqueID).Msg("phase2: PIN not yet entered — returning paired=0 so client can retry after PIN entry")
+		xmlOK(w, `<paired>0</paired>`)
+		return
 	}
+	log.Info().Str("uniqueID", uniqueID).Msg("phase2: PIN available, responding immediately")
 
 	challengeEnc, err := hexDecode(challengeHex)
 	if err != nil {
