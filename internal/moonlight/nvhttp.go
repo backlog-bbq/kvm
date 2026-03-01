@@ -530,8 +530,11 @@ func (s *Server) handlePairServerChallengeResp(w http.ResponseWriter, uniqueID, 
 
 	// Compute and return our pairing secret:
 	// serverSecret = random 16 bytes
-	// serverSignature = RSA_sign(SHA256(serverSecret ‖ serverCert.Signature))
+	// serverSignature = RSA_sign(SHA256(serverSecret))
 	// pairingsecret = hex(serverSecret ‖ serverSignature)
+	//
+	// The Moonlight client verifies: RSA_verify(serverPubKey, SHA256(serverSecret), sig)
+	// — the cert signature is NOT included in the hash.
 	serverSecret := make([]byte, 16)
 	if _, err := rand.Read(serverSecret); err != nil {
 		log.Error().Err(err).Msg("phase3: rand.Read failed")
@@ -539,12 +542,7 @@ func (s *Server) handlePairServerChallengeResp(w http.ResponseWriter, uniqueID, 
 		return
 	}
 
-	s.store.mu.RLock()
-	serverCertSig := s.store.serverCert.Signature
-	s.store.mu.RUnlock()
-
-	toSign := append(append([]byte(nil), serverSecret...), serverCertSig...)
-	serverSignature, err := s.store.rsaSignSHA256(toSign)
+	serverSignature, err := s.store.rsaSignSHA256(serverSecret)
 	if err != nil {
 		log.Error().Err(err).Str("uniqueID", uniqueID).Msg("phase3: RSA sign failed")
 		xmlError(w, 500, "failed to sign server secret")
@@ -613,7 +611,8 @@ func (s *Server) handlePairClientPairingSecret(w http.ResponseWriter, uniqueID, 
 		return
 	}
 
-	// Verify client signature: RSA_verify(clientPubKey, SHA256(clientSecret ‖ clientCert.Signature), clientSignature)
+	// Verify client signature: RSA_verify(clientPubKey, SHA256(clientSecret), clientSignature)
+	// The Moonlight client signs just the secret — cert signature is NOT included.
 	clientCert, parseErr := x509.ParseCertificate(clientCertDER)
 	if parseErr != nil {
 		log.Warn().Err(parseErr).Str("uniqueID", uniqueID).Msg("phase4: could not parse client cert")
@@ -621,9 +620,7 @@ func (s *Server) handlePairClientPairingSecret(w http.ResponseWriter, uniqueID, 
 		return
 	}
 
-	clientSig := clientCert.Signature
-	toVerify := append(append([]byte(nil), clientSecret...), clientSig...)
-	verifyHash := sha256.Sum256(toVerify)
+	verifyHash := sha256.Sum256(clientSecret)
 
 	clientPubKey, ok2 := clientCert.PublicKey.(*rsa.PublicKey)
 	if !ok2 {
@@ -640,27 +637,7 @@ func (s *Server) handlePairClientPairingSecret(w http.ResponseWriter, uniqueID, 
 		xmlError(w, 403, "client signature verification failed")
 		return
 	}
-	log.Debug().Str("uniqueID", uniqueID).Msg("phase4: client signature verified OK")
-
-	// Verify the phase-3 challenge hash now that we have the client cert signature.
-	if len(state.clientChallengeHash) > 0 && len(state.serverResponse) > 0 {
-		expected := sha256.Sum256(append(append([]byte(nil), state.serverResponse...), clientSig...))
-		if len(state.clientChallengeHash) >= 32 {
-			if [32]byte(state.clientChallengeHash[:32]) != expected {
-				log.Warn().
-					Str("uniqueID", uniqueID).
-					Str("got", hex.EncodeToString(state.clientChallengeHash[:32])).
-					Str("expected", hex.EncodeToString(expected[:])).
-					Msg("phase4: client challenge hash mismatch — wrong PIN or tampered exchange")
-				activePairingsMu.Lock()
-				delete(activePairings, uniqueID)
-				activePairingsMu.Unlock()
-				xmlError(w, 403, "challenge verification failed")
-				return
-			}
-			log.Debug().Str("uniqueID", uniqueID).Msg("phase4: client challenge hash verified OK")
-		}
-	}
+	log.Info().Str("uniqueID", uniqueID).Msg("phase4: client signature verified OK")
 
 	// Store the client cert from Phase 1 as PEM.
 	clientCertPEM := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: clientCertDER}))
