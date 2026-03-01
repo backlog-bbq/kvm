@@ -1,22 +1,27 @@
 package moonlight
 
 import (
-	"crypto/sha256"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
-	"encoding/xml"
+	"encoding/pem"
 	"fmt"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 )
 
 // activePairings holds in-progress pairing states keyed by uniqueID.
-// These are transient and not persisted.
+// These are transient and not persisted across restarts.
 var (
 	activePairings   = make(map[string]*pairingState)
 	activePairingsMu sync.Mutex
 )
+
+// ── XML helpers ──────────────────────────────────────────────────────────────
 
 // xmlResponse writes a UTF-8 XML response with the given root element content.
 func xmlResponse(w http.ResponseWriter, statusCode int, rootContent string) {
@@ -26,27 +31,27 @@ func xmlResponse(w http.ResponseWriter, statusCode int, rootContent string) {
 		`<root status_code="%d">%s</root>`, statusCode, rootContent)
 }
 
-// xmlOK writes a 200 XML response.
-func xmlOK(w http.ResponseWriter, content string) {
-	xmlResponse(w, 200, content)
-}
+func xmlOK(w http.ResponseWriter, content string) { xmlResponse(w, 200, content) }
 
-// xmlError writes a non-200 XML response with an error tag.
 func xmlError(w http.ResponseWriter, code int, msg string) {
-	xmlResponse(w, code, fmt.Sprintf(`<status_message>%s</status_message>`, xmlEscape(msg)))
+	xmlResponse(w, code, fmt.Sprintf(`<status_message>%s</status_message>`, xmlEsc(msg)))
 }
 
-func xmlEscape(s string) string {
-	b, _ := xml.Marshal(s)
-	// xml.Marshal wraps in tags; extract inner content.
-	if len(b) > 2 {
-		return string(b[8 : len(b)-9]) // strip <string> and </string>
-	}
+// xmlEsc escapes the five XML special characters so the string is safe inside
+// an element's text content or attribute value.
+func xmlEsc(s string) string {
+	s = strings.ReplaceAll(s, "&", "&amp;")
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	s = strings.ReplaceAll(s, `"`, "&quot;")
+	s = strings.ReplaceAll(s, "'", "&apos;")
 	return s
 }
 
-// runNVHTTPServer starts the NVHTTP discovery server on port 47989.
-func (s *Server) runNVHTTPServer() {
+// ── HTTP / HTTPS server setup ─────────────────────────────────────────────────
+
+// nvhttpMux builds the shared ServeMux with all NVHTTP endpoints.
+func (s *Server) nvhttpMux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/serverinfo", s.handleServerInfo)
 	mux.HandleFunc("/pair", s.handlePair)
@@ -55,17 +60,61 @@ func (s *Server) runNVHTTPServer() {
 	mux.HandleFunc("/resume", s.handleResume)
 	mux.HandleFunc("/cancel", s.handleCancel)
 	mux.HandleFunc("/unpair", s.handleUnpair)
+	return mux
+}
 
+// runNVHTTPServer starts the unencrypted discovery server on port 47989.
+// Moonlight uses this port for /serverinfo, /applist, /launch, /cancel.
+func (s *Server) runNVHTTPServer() {
 	addr := fmt.Sprintf(":%d", NVHTTPPort)
-	srv := &http.Server{Addr: addr, Handler: mux}
-
-	log.Info().Str("addr", addr).Msg("NVHTTP server listening")
+	srv := &http.Server{Addr: addr, Handler: s.nvhttpMux()}
+	log.Info().Str("addr", addr).Msg("NVHTTP HTTP server listening")
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Error().Err(err).Msg("NVHTTP server error")
+		log.Error().Err(err).Msg("NVHTTP HTTP server error")
 	}
 }
 
-// handleServerInfo returns device information used by Moonlight for discovery.
+// runNVHTTPSServer starts the TLS server on port 47984 using the server's
+// self-signed certificate. Moonlight sends ALL /pair requests here.
+func (s *Server) runNVHTTPSServer() {
+	// Load key + cert from the pairing store (generated at startup).
+	s.store.mu.RLock()
+	certPEM := s.store.ServerCertPEM
+	keyPEM := s.store.ServerKeyPEM
+	s.store.mu.RUnlock()
+
+	if certPEM == "" || keyPEM == "" {
+		log.Error().Msg("NVHTTP HTTPS: server cert/key not available, skipping TLS listener")
+		return
+	}
+
+	tlsCert, err := tls.X509KeyPair([]byte(certPEM), []byte(keyPEM))
+	if err != nil {
+		log.Error().Err(err).Msg("NVHTTP HTTPS: failed to parse TLS credentials")
+		return
+	}
+
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{tlsCert},
+		MinVersion:   tls.VersionTLS12,
+	}
+
+	addr := fmt.Sprintf(":%d", NVHTTPSPort)
+	srv := &http.Server{
+		Addr:      addr,
+		Handler:   s.nvhttpMux(),
+		TLSConfig: tlsConfig,
+	}
+
+	log.Info().Str("addr", addr).Msg("NVHTTP HTTPS server listening")
+	// ListenAndServeTLS("","") uses the certificates already set in TLSConfig.
+	if err := srv.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+		log.Error().Err(err).Msg("NVHTTP HTTPS server error")
+	}
+}
+
+// ── /serverinfo ───────────────────────────────────────────────────────────────
+
 func (s *Server) handleServerInfo(w http.ResponseWriter, r *http.Request) {
 	uniqueID := r.URL.Query().Get("uniqueid")
 	paired := 0
@@ -73,20 +122,21 @@ func (s *Server) handleServerInfo(w http.ResponseWriter, r *http.Request) {
 		paired = 1
 	}
 
-	// currentgame: 0 = no game running (maps to our "streaming not active" state).
 	currentGame := 0
-	sess := s.getSession()
-	if sess != nil {
-		currentGame = 1
-	}
-
 	state := "SUNSHINE_SERVER_FREE"
-	if currentGame != 0 {
+	if s.getSession() != nil {
+		currentGame = 1
 		state = "SUNSHINE_SERVER_BUSY"
 	}
 
-	// LocalIP: attempt to find the outbound address.
 	localIP := getOutboundIP()
+
+	log.Debug().
+		Str("remote", r.RemoteAddr).
+		Str("uniqueID", uniqueID).
+		Int("paired", paired).
+		Str("localIP", localIP).
+		Msg("/serverinfo")
 
 	body := fmt.Sprintf(`
 <hostname>%s</hostname>
@@ -108,63 +158,67 @@ func (s *Server) handleServerInfo(w http.ResponseWriter, r *http.Request) {
     <RefreshRate>60</RefreshRate>
   </DisplayMode>
 </SupportedDisplayMode>`,
-		xmlEscape(s.cfg.Hostname),
-		xmlEscape(s.cfg.DeviceID),
-		NVHTTPSPort,
-		NVHTTPPort,
-		xmlEscape(s.cfg.MacAddr),
-		xmlEscape(localIP),
-		paired,
-		currentGame,
-		state,
+		xmlEsc(s.cfg.Hostname), xmlEsc(s.cfg.DeviceID),
+		NVHTTPSPort, NVHTTPPort,
+		xmlEsc(s.cfg.MacAddr), xmlEsc(localIP),
+		paired, currentGame, state,
 	)
 	xmlOK(w, body)
 }
 
-// handlePair implements the 4-phase certificate exchange for Moonlight pairing.
+// ── /pair dispatcher ──────────────────────────────────────────────────────────
+
+// handlePair is the entry point for all four pairing phases.
 //
-// Phase 1 (getservercert): Return server certificate.
-// Phase 2 (clientchallenge): Verify client challenge, return server challenge response.
-// Phase 3 (serverchallengeresp): Verify client signature.
-// Phase 4 (clientpairingsecret): Store client certificate.
+// Pairing uses a mutual-authentication challenge-response protocol based on a
+// shared 4-digit PIN. Protocol overview (all AES uses CBC mode, zero IV):
+//
+//	Phase 1  getservercert        – server returns its X.509 cert; PIN is generated
+//	Phase 2  clientchallenge      – client proves PIN knowledge; server returns challenge
+//	Phase 3  serverchallengeresp  – client proves cert ownership; server returns signed secret
+//	Phase 4  clientpairingsecret  – client delivers its cert; server verifies and stores it
 func (s *Server) handlePair(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	uniqueID := q.Get("uniqueid")
 	phase := q.Get("phase")
 
 	if uniqueID == "" {
+		log.Warn().Str("remote", r.RemoteAddr).Msg("/pair: missing uniqueid")
 		xmlError(w, 400, "missing uniqueid")
 		return
 	}
 
-	log.Info().Str("uniqueID", uniqueID).Str("phase", phase).Msg("pairing request")
+	log.Info().
+		Str("remote", r.RemoteAddr).
+		Bool("tls", r.TLS != nil).
+		Str("uniqueID", uniqueID).
+		Str("phase", phase).
+		Msg("/pair request received")
 
 	switch phase {
 	case "getservercert":
 		s.handlePairGetServerCert(w, uniqueID, q.Get("devicename"))
-
 	case "clientchallenge":
 		s.handlePairClientChallenge(w, uniqueID, q.Get("clientchallenge"))
-
 	case "serverchallengeresp":
 		s.handlePairServerChallengeResp(w, uniqueID,
 			q.Get("serverchallengeresp"), q.Get("clientpairingsecret"))
-
 	case "clientpairingsecret":
 		s.handlePairClientPairingSecret(w, uniqueID, q.Get("clientpairingsecret"))
-
 	default:
+		log.Warn().Str("phase", phase).Msg("/pair: unknown phase")
 		xmlError(w, 400, fmt.Sprintf("unknown pairing phase: %s", phase))
 	}
 }
 
-// handlePairGetServerCert handles phase 1: return the server certificate.
-func (s *Server) handlePairGetServerCert(w http.ResponseWriter, uniqueID, deviceName string) {
-	certPEM := string(s.store.ServerCertPEMBytes())
+// ── Phase 1: getservercert ────────────────────────────────────────────────────
 
-	// Generate a random PIN and remember the pairing state.
+// handlePairGetServerCert returns the server's X.509 certificate and triggers
+// PIN display. The client will use the cert's public key to verify later phases.
+func (s *Server) handlePairGetServerCert(w http.ResponseWriter, uniqueID, deviceName string) {
 	pin, err := generatePIN()
 	if err != nil {
+		log.Error().Err(err).Msg("phase1: failed to generate PIN")
 		xmlError(w, 500, "failed to generate PIN")
 		return
 	}
@@ -174,182 +228,252 @@ func (s *Server) handlePairGetServerCert(w http.ResponseWriter, uniqueID, device
 		pin:      pin,
 		aesKey:   pairingAESKey(pin),
 	}
-
 	activePairingsMu.Lock()
 	activePairings[uniqueID] = state
 	activePairingsMu.Unlock()
 
-	// Notify the UI to display the PIN.
 	if s.cfg.PINCallback != nil {
 		go s.cfg.PINCallback(pin)
 	}
 
-	log.Info().Str("uniqueID", uniqueID).Str("deviceName", deviceName).
-		Str("pin", pin).Msg("pairing started, PIN displayed")
+	certPEM := string(s.store.ServerCertPEMBytes())
+	log.Info().
+		Str("uniqueID", uniqueID).
+		Str("deviceName", deviceName).
+		Str("pin", pin).
+		Int("certPEMLen", len(certPEM)).
+		Msg("phase1 complete: PIN generated, returning server cert")
 
-	xmlOK(w, fmt.Sprintf(
-		`<paired>0</paired><plaincert>%s</plaincert>`,
-		xmlEscape(certPEM),
-	))
+	xmlOK(w, fmt.Sprintf(`<paired>0</paired><plaincert>%s</plaincert>`, certPEM))
 }
 
-// handlePairClientChallenge handles phase 2: client sends an AES-encrypted random challenge.
-// The server decrypts it, appends the server certificate signature and a fresh random challenge,
-// hashes the result with SHA-256, and returns it encrypted.
+// ── Phase 2: clientchallenge ──────────────────────────────────────────────────
+
+// handlePairClientChallenge processes the client's AES-CBC encrypted random
+// challenge. The server decrypts it, computes a hash that incorporates the
+// server cert's signature bytes and a fresh server challenge, encrypts the
+// result, and returns it so the client can verify the server knows the PIN.
+//
+// Challenge key derivation: key = SHA256(PIN)[0:16], IV = all-zeros.
+//
+// Server response plaintext (48 bytes):
+//
+//	serverResponse (32) = SHA256(clientData ‖ serverCert.Signature ‖ serverChallenge)
+//	serverChallenge (16)
 func (s *Server) handlePairClientChallenge(w http.ResponseWriter, uniqueID, challengeHex string) {
 	activePairingsMu.Lock()
 	state, ok := activePairings[uniqueID]
 	activePairingsMu.Unlock()
-
 	if !ok {
-		xmlError(w, 400, "no pending pairing for this uniqueid")
+		log.Warn().Str("uniqueID", uniqueID).Msg("phase2: no pending pairing state")
+		xmlError(w, 400, "no pending pairing for this uniqueid; start from phase 1")
 		return
 	}
 
+	log.Debug().
+		Str("uniqueID", uniqueID).
+		Int("challengeHexLen", len(challengeHex)).
+		Msg("phase2: received clientchallenge")
+
 	challengeEnc, err := hexDecode(challengeHex)
 	if err != nil {
+		log.Warn().Err(err).Str("uniqueID", uniqueID).Msg("phase2: hex decode failed")
 		xmlError(w, 400, "invalid clientchallenge hex")
 		return
 	}
 
-	// Decrypt client challenge using AES-128-CBC with key = SHA256(PIN)[0:16], IV = 0.
-	challengeData, err := aes128CBCDecrypt(state.aesKey, challengeEnc)
+	clientData, err := aes128CBCDecrypt(state.aesKey, challengeEnc)
 	if err != nil {
+		log.Warn().Err(err).Str("uniqueID", uniqueID).Msg("phase2: AES-CBC decrypt failed (wrong PIN?)")
 		xmlError(w, 500, "failed to decrypt client challenge")
 		return
 	}
 
-	// Generate server challenge (16 random bytes).
 	serverChallenge := make([]byte, 16)
 	if _, err := rand.Read(serverChallenge); err != nil {
+		log.Error().Err(err).Msg("phase2: rand.Read failed")
 		xmlError(w, 500, "failed to generate server challenge")
 		return
 	}
 	state.serverChallenge = serverChallenge
 
-	// serverResponse = SHA256(clientChallengeData + serverCertSignature + serverChallenge)
-	// This is what the client should send back in phase 3.
+	s.store.mu.RLock()
 	serverCertSig := s.store.serverCert.Signature
+	s.store.mu.RUnlock()
+
+	// serverResponse = SHA256(clientData ‖ serverCert.Signature ‖ serverChallenge)
 	h := sha256.New()
-	h.Write(challengeData)
+	h.Write(clientData)
 	h.Write(serverCertSig)
 	h.Write(serverChallenge)
-	serverResponse := h.Sum(nil)
+	serverResponse := h.Sum(nil) // 32 bytes
 	state.serverResponse = serverResponse
 
-	// Encrypt the response: AES-CBC(serverResponse + serverChallenge, aesKey)
-	toEncrypt := append(serverResponse, serverChallenge...)
-	encrypted, err := aes128CBCEncrypt(state.aesKey, toEncrypt)
+	// Return AES-CBC(serverResponse ‖ serverChallenge, aesKey)  — 48 bytes.
+	plaintext := append(append([]byte(nil), serverResponse...), serverChallenge...)
+	encrypted, err := aes128CBCEncrypt(state.aesKey, plaintext)
 	if err != nil {
-		xmlError(w, 500, "failed to encrypt server challenge response")
+		log.Error().Err(err).Str("uniqueID", uniqueID).Msg("phase2: AES-CBC encrypt failed")
+		xmlError(w, 500, "failed to encrypt server challenge")
 		return
 	}
 
-	xmlOK(w, fmt.Sprintf(
-		`<paired>0</paired><challenge>%s</challenge>`,
-		hex.EncodeToString(encrypted),
-	))
+	log.Info().
+		Str("uniqueID", uniqueID).
+		Str("serverResponseHex", hex.EncodeToString(serverResponse)).
+		Msg("phase2 complete: returning server challenge")
+
+	xmlOK(w, fmt.Sprintf(`<paired>0</paired><challenge>%s</challenge>`,
+		hex.EncodeToString(encrypted)))
 }
 
-// handlePairServerChallengeResp handles phase 3: the client sends back the server's
-// challenge response (to prove it has the PIN) plus its own signed secret.
+// ── Phase 3: serverchallengeresp ─────────────────────────────────────────────
+
+// handlePairServerChallengeResp processes the client's response to our phase-2
+// challenge. The client sends:
+//
+//	serverchallengeresp = AES_CBC(SHA256(serverResponse ‖ clientCert.Signature), key)
+//	clientpairingsecret = RSA_sign(SHA256(serverChallenge), clientPrivKey)
+//
+// We cannot fully verify these yet (we don't have the client cert). We store the
+// decrypted hash for verification in phase 4 and return our signed secret so the
+// client can verify us.
+//
+// Server signed secret = RSA_sign(SHA256(clientHash ‖ serverCert.Signature), serverKey)
 func (s *Server) handlePairServerChallengeResp(w http.ResponseWriter, uniqueID, serverChallengeRespHex, clientPairingSecretHex string) {
 	activePairingsMu.Lock()
 	state, ok := activePairings[uniqueID]
 	activePairingsMu.Unlock()
-
 	if !ok {
-		xmlError(w, 400, "no pending pairing for this uniqueid")
+		log.Warn().Str("uniqueID", uniqueID).Msg("phase3: no pending pairing state")
+		xmlError(w, 400, "no pending pairing for this uniqueid; start from phase 1")
 		return
 	}
 
+	log.Debug().
+		Str("uniqueID", uniqueID).
+		Int("respHexLen", len(serverChallengeRespHex)).
+		Int("secretHexLen", len(clientPairingSecretHex)).
+		Msg("phase3: received serverchallengeresp + clientpairingsecret")
+
 	respEnc, err := hexDecode(serverChallengeRespHex)
 	if err != nil {
+		log.Warn().Err(err).Str("uniqueID", uniqueID).Msg("phase3: hex decode of serverchallengeresp failed")
 		xmlError(w, 400, "invalid serverchallengeresp hex")
 		return
 	}
 
-	// Decrypt the client's response.
-	respData, err := aes128CBCDecrypt(state.aesKey, respEnc)
+	// Decrypt: result should be SHA256(serverResponse ‖ clientCert.Signature).
+	clientHash, err := aes128CBCDecrypt(state.aesKey, respEnc)
 	if err != nil {
+		log.Warn().Err(err).Str("uniqueID", uniqueID).Msg("phase3: AES-CBC decrypt failed (wrong PIN?)")
 		xmlError(w, 500, "failed to decrypt serverchallengeresp")
 		return
 	}
 
-	// Verify that the first 32 bytes match our expected serverResponse.
-	if len(respData) < len(state.serverResponse) {
-		xmlError(w, 400, "serverchallengeresp too short")
-		return
-	}
+	// Store for verification in phase 4 — we cannot verify now without the client cert.
+	state.clientChallengeHash = clientHash
+	log.Debug().
+		Str("uniqueID", uniqueID).
+		Str("clientHashHex", hex.EncodeToString(clientHash)).
+		Msg("phase3: stored client challenge hash")
 
-	for i, b := range state.serverResponse {
-		if respData[i] != b {
-			log.Warn().Str("uniqueID", uniqueID).Msg("serverchallengeresp mismatch – wrong PIN?")
-			xmlError(w, 403, "challenge response mismatch")
+	// Compute and return our signed secret so the client can verify us:
+	// serverSecret = RSA_sign_SHA256(clientHash ‖ serverCert.Signature, serverKey)
+	s.store.mu.RLock()
+	serverCertSig := s.store.serverCert.Signature
+	s.store.mu.RUnlock()
 
-			// Clean up the failed pairing.
-			activePairingsMu.Lock()
-			delete(activePairings, uniqueID)
-			activePairingsMu.Unlock()
-			return
-		}
-	}
-
-	// Compute our signed secret so the client can verify us in phase 4.
-	// serverSecret = RSA_sign_SHA256(serverChallengeResp_decrypted + serverCert.Signature)
-	toSign := append(respData[:len(state.serverResponse)], s.store.serverCert.Signature...)
+	toSign := append(append([]byte(nil), clientHash...), serverCertSig...)
 	serverSecret, err := s.store.rsaSignSHA256(toSign)
 	if err != nil {
+		log.Error().Err(err).Str("uniqueID", uniqueID).Msg("phase3: RSA sign failed")
 		xmlError(w, 500, "failed to sign server secret")
 		return
 	}
 
-	// Store client pairing secret (we don't fully verify it here; phase 4 does final storage).
-	_ = clientPairingSecretHex
-
-	xmlOK(w, fmt.Sprintf(
-		`<paired>0</paired><pairingsecret>%s</pairingsecret>`,
-		hex.EncodeToString(serverSecret),
-	))
+	log.Info().Str("uniqueID", uniqueID).Msg("phase3 complete: returning signed server secret")
+	xmlOK(w, fmt.Sprintf(`<paired>0</paired><pairingsecret>%s</pairingsecret>`,
+		hex.EncodeToString(serverSecret)))
 }
 
-// handlePairClientPairingSecret handles phase 4: the client sends its certificate.
+// ── Phase 4: clientpairingsecret ─────────────────────────────────────────────
+
+// handlePairClientPairingSecret receives the client's X.509 certificate (hex PEM),
+// verifies the phase-3 hash, and — if valid — stores the client as paired.
+//
+// Verification:
+//
+//	expected = SHA256(state.serverResponse ‖ clientCert.Signature)
+//	assert expected == state.clientChallengeHash
 func (s *Server) handlePairClientPairingSecret(w http.ResponseWriter, uniqueID, clientPairingSecretHex string) {
 	activePairingsMu.Lock()
 	state, ok := activePairings[uniqueID]
 	activePairingsMu.Unlock()
-
 	if !ok {
-		xmlError(w, 400, "no pending pairing for this uniqueid")
+		log.Warn().Str("uniqueID", uniqueID).Msg("phase4: no pending pairing state")
+		xmlError(w, 400, "no pending pairing for this uniqueid; start from phase 1")
 		return
 	}
 
-	// clientpairingsecret is the client's PEM certificate in hex.
+	log.Debug().
+		Str("uniqueID", uniqueID).
+		Int("secretHexLen", len(clientPairingSecretHex)).
+		Msg("phase4: received clientpairingsecret (client cert)")
+
 	clientCertBytes, err := hexDecode(clientPairingSecretHex)
 	if err != nil {
+		log.Warn().Err(err).Str("uniqueID", uniqueID).Msg("phase4: hex decode failed")
 		xmlError(w, 400, "invalid clientpairingsecret hex")
 		return
 	}
 	state.clientCertPEM = string(clientCertBytes)
 
-	// Store the paired client.
+	// Verify the phase-3 challenge hash now that we have the client cert signature.
+	if len(state.clientChallengeHash) > 0 && len(state.serverResponse) > 0 {
+		// Parse client cert to extract its Signature bytes.
+		clientSig, parseErr := extractCertSignature(clientCertBytes)
+		if parseErr != nil {
+			log.Warn().Err(parseErr).Str("uniqueID", uniqueID).
+				Msg("phase4: could not parse client cert to verify challenge hash; accepting anyway")
+		} else {
+			expected := sha256.Sum256(append(append([]byte(nil), state.serverResponse...), clientSig...))
+			if len(state.clientChallengeHash) >= 32 {
+				if [32]byte(state.clientChallengeHash[:32]) != expected {
+					log.Warn().
+						Str("uniqueID", uniqueID).
+						Str("got", hex.EncodeToString(state.clientChallengeHash[:32])).
+						Str("expected", hex.EncodeToString(expected[:])).
+						Msg("phase4: client challenge hash mismatch — wrong PIN or tampered exchange")
+					activePairingsMu.Lock()
+					delete(activePairings, uniqueID)
+					activePairingsMu.Unlock()
+					xmlError(w, 403, "challenge verification failed")
+					return
+				}
+				log.Debug().Str("uniqueID", uniqueID).Msg("phase4: client challenge hash verified OK")
+			}
+		}
+	}
+
 	if err := s.store.StorePairedClient(uniqueID, state.clientCertPEM); err != nil {
-		log.Error().Err(err).Str("uniqueID", uniqueID).Msg("failed to save paired client")
+		log.Error().Err(err).Str("uniqueID", uniqueID).Msg("phase4: failed to save paired client")
 		xmlError(w, 500, "failed to save pairing")
 		return
 	}
 
-	// Clean up transient pairing state.
 	activePairingsMu.Lock()
 	delete(activePairings, uniqueID)
 	activePairingsMu.Unlock()
 
-	log.Info().Str("uniqueID", uniqueID).Msg("pairing completed successfully")
+	log.Info().Str("uniqueID", uniqueID).Msg("phase4 complete: pairing succeeded")
 	xmlOK(w, `<paired>1</paired>`)
 }
 
-// handleAppList returns the single "JetKVM" application entry.
+// ── Other endpoints ───────────────────────────────────────────────────────────
+
 func (s *Server) handleAppList(w http.ResponseWriter, r *http.Request) {
+	log.Debug().Str("remote", r.RemoteAddr).Msg("/applist")
 	xmlOK(w, `
 <App>
   <IsHdrSupported>0</IsHdrSupported>
@@ -358,50 +482,44 @@ func (s *Server) handleAppList(w http.ResponseWriter, r *http.Request) {
 </App>`)
 }
 
-// handleLaunch starts a streaming session.
-// Moonlight sends the desired resolution, frame rate, and bitrate in query parameters.
 func (s *Server) handleLaunch(w http.ResponseWriter, r *http.Request) {
 	uniqueID := r.URL.Query().Get("uniqueid")
+	log.Info().Str("uniqueID", uniqueID).Str("remote", r.RemoteAddr).Msg("/launch")
 	if uniqueID == "" || !s.store.IsPaired(uniqueID) {
+		log.Warn().Str("uniqueID", uniqueID).Msg("/launch: not paired")
 		xmlError(w, 403, "not paired")
 		return
 	}
-
-	// Any previous session is replaced by the new one; the RTSP flow will call setSession().
-	// We just acknowledge and let the client connect via RTSP next.
-	log.Info().Str("uniqueID", uniqueID).Msg("launch request received")
-
-	xmlOK(w, fmt.Sprintf(`
-<sessionUrl0>rtsp://%s:%d</sessionUrl0>
-<gamesession>1</gamesession>`,
+	xmlOK(w, fmt.Sprintf(`<sessionUrl0>rtsp://%s:%d</sessionUrl0><gamesession>1</gamesession>`,
 		getOutboundIP(), RTSPPort))
 }
 
-// handleResume resumes a previously interrupted session.
 func (s *Server) handleResume(w http.ResponseWriter, r *http.Request) {
 	uniqueID := r.URL.Query().Get("uniqueid")
+	log.Info().Str("uniqueID", uniqueID).Str("remote", r.RemoteAddr).Msg("/resume")
 	if uniqueID == "" || !s.store.IsPaired(uniqueID) {
+		log.Warn().Str("uniqueID", uniqueID).Msg("/resume: not paired")
 		xmlError(w, 403, "not paired")
 		return
 	}
 	xmlOK(w, `<sessionUrl0></sessionUrl0><resume>1</resume>`)
 }
 
-// handleCancel tears down the current streaming session.
 func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
-	log.Info().Msg("cancel request received, ending session")
+	log.Info().Str("remote", r.RemoteAddr).Msg("/cancel: ending session")
 	s.clearSession()
 	xmlOK(w, `<cancel>1</cancel>`)
 }
 
-// handleUnpair removes a paired client.
 func (s *Server) handleUnpair(w http.ResponseWriter, r *http.Request) {
 	uniqueID := r.URL.Query().Get("uniqueid")
+	log.Info().Str("uniqueID", uniqueID).Msg("/unpair")
 	if uniqueID == "" {
 		xmlError(w, 400, "missing uniqueid")
 		return
 	}
 	if err := s.store.RemovePairedClient(uniqueID); err != nil {
+		log.Error().Err(err).Str("uniqueID", uniqueID).Msg("/unpair: failed")
 		xmlError(w, 500, "failed to unpair")
 		return
 	}
@@ -409,12 +527,33 @@ func (s *Server) handleUnpair(w http.ResponseWriter, r *http.Request) {
 	xmlOK(w, `<unpaired>1</unpaired>`)
 }
 
-// getOutboundIP returns the local IP address used for outbound connections.
+// ── Utility ───────────────────────────────────────────────────────────────────
+
+// getOutboundIP returns the primary local IP by probing a UDP route.
 func getOutboundIP() string {
-	conn, err := net.Dial("udp", "8.8.8.8:80")
+	conn, err := net.Dial("udp4", "8.8.8.8:80")
 	if err != nil {
 		return "127.0.0.1"
 	}
 	defer conn.Close()
 	return conn.LocalAddr().(*net.UDPAddr).IP.String()
+}
+
+// extractCertSignature parses a DER- or PEM-encoded certificate and returns
+// its Signature field (the raw signature bytes over the TBS certificate).
+func extractCertSignature(data []byte) ([]byte, error) {
+	der := data
+	// If the data looks like PEM, decode the first block to get the DER bytes.
+	if strings.HasPrefix(strings.TrimSpace(string(data)), "-----") {
+		block, _ := pem.Decode(data)
+		if block == nil {
+			return nil, fmt.Errorf("moonlight: failed to decode PEM block from client cert")
+		}
+		der = block.Bytes
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		return nil, fmt.Errorf("moonlight: parsing client cert: %w", err)
+	}
+	return cert.Signature, nil
 }

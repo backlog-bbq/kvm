@@ -128,6 +128,7 @@ func (s *Server) Start() error {
 	}
 
 	go s.runNVHTTPServer()
+	go s.runNVHTTPSServer()
 	go s.runRTSPServer()
 	go s.runVideoStream()
 	go s.runAudioStream()
