@@ -437,31 +437,42 @@ func (s *Server) handlePairClientChallenge(w http.ResponseWriter, r *http.Reques
 		Str("clientDataHex", hex.EncodeToString(clientData)).
 		Msg("phase2: client challenge decrypted")
 
+	// Generate two SEPARATE random 16-byte values:
+	// - serverSecret:    used in the hash (and returned later in Phase 3 pairingsecret)
+	// - serverChallenge: appended to the encrypted response (used by client in Phase 3)
+	serverSecret := make([]byte, 16)
 	serverChallenge := make([]byte, 16)
-	if _, err := rand.Read(serverChallenge); err != nil {
+	if _, err := rand.Read(serverSecret); err != nil {
 		log.Error().Err(err).Msg("phase2: rand.Read failed")
-		xmlError(w, 500, "failed to generate server challenge")
+		xmlError(w, 500, "internal error")
 		return
 	}
+	if _, err := rand.Read(serverChallenge); err != nil {
+		log.Error().Err(err).Msg("phase2: rand.Read failed")
+		xmlError(w, 500, "internal error")
+		return
+	}
+	state.serverSecret = serverSecret
 	state.serverChallenge = serverChallenge
 
 	s.store.mu.RLock()
 	serverCertSig := s.store.serverCert.Signature
 	s.store.mu.RUnlock()
 
-	// serverResponse = SHA256(clientData ‖ serverCert.Signature ‖ serverChallenge)
+	// serverResponse = SHA256(clientChallenge ‖ serverCert.Signature ‖ serverSecret)
+	// The client verifies this AFTER Phase 3 using the serverSecret from pairingsecret.
 	h := sha256.New()
 	h.Write(clientData)
 	h.Write(serverCertSig)
-	h.Write(serverChallenge)
+	h.Write(serverSecret)
 	serverResponse := h.Sum(nil) // 32 bytes
 	state.serverResponse = serverResponse
 
-	// Return AES-CBC(serverResponse ‖ serverChallenge, aesKey)  — 48 bytes.
+	// Return AES_ECB(serverResponse ‖ serverChallenge) — 48 bytes.
 	plaintext := append(append([]byte(nil), serverResponse...), serverChallenge...)
 	encrypted, err := aes128ECBEncrypt(state.aesKey, plaintext)
 	if err != nil {
-		log.Error().Err(err).Str("uniqueID", uniqueID).Msg("phase2: AES-CBC encrypt failed")
+		log.Error().Err(err).Str("uniqueID", uniqueID).Msg("phase2: AES-ECB encrypt failed")
 		xmlError(w, 500, "failed to encrypt server challenge")
 		return
 	}
@@ -533,17 +544,16 @@ func (s *Server) handlePairServerChallengeResp(w http.ResponseWriter, uniqueID, 
 		Str("clientHashHex", hex.EncodeToString(clientHash)).
 		Msg("phase3: stored client challenge hash (will verify in phase 4)")
 
-	// Compute and return our pairing secret:
-	// serverSecret = random 16 bytes
+	// Return the serverSecret generated in Phase 2 as our pairing secret:
 	// serverSignature = RSA_sign(SHA256(serverSecret))
 	// pairingsecret = hex(serverSecret ‖ serverSignature)
 	//
 	// The Moonlight client verifies: RSA_verify(serverPubKey, SHA256(serverSecret), sig)
 	// — the cert signature is NOT included in the hash.
-	serverSecret := make([]byte, 16)
-	if _, err := rand.Read(serverSecret); err != nil {
-		log.Error().Err(err).Msg("phase3: rand.Read failed")
-		xmlError(w, 500, "failed to generate server secret")
+	serverSecret := state.serverSecret
+	if len(serverSecret) == 0 {
+		log.Error().Str("uniqueID", uniqueID).Msg("phase3: no serverSecret from Phase 2")
+		xmlError(w, 500, "internal error: missing server secret")
 		return
 	}
 
