@@ -350,18 +350,18 @@ func (s *Server) handlePairGetServerCert(w http.ResponseWriter, r *http.Request,
 		log.Info().Str("uniqueID", uniqueID).Msg("phase1: PIN already available, responding immediately")
 	}
 
-	// Return server cert as hex-encoded DER.
+	// Return server cert as hex-encoded PEM (not DER).
+	// Moonlight clients hex-decode this and parse with PEM_read_bio_X509().
 	s.store.mu.RLock()
 	certPEM := s.store.ServerCertPEM
 	s.store.mu.RUnlock()
 
-	block, _ := pem.Decode([]byte(certPEM))
-	if block == nil {
-		log.Error().Msg("phase1: failed to decode server cert PEM")
+	if certPEM == "" {
+		log.Error().Msg("phase1: server cert PEM is empty")
 		xmlError(w, 500, "internal error")
 		return
 	}
-	certHex := hex.EncodeToString(block.Bytes)
+	certHex := hex.EncodeToString([]byte(certPEM))
 
 	log.Info().
 		Str("uniqueID", uniqueID).
