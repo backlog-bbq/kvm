@@ -253,7 +253,7 @@ func (s *Server) handlePair(w http.ResponseWriter, r *http.Request) {
 
 	switch phase {
 	case "getservercert":
-		s.handlePairGetServerCert(w, uniqueID, q.Get("devicename"), q.Get("salt"), q.Get("clientcert"))
+		s.handlePairGetServerCert(w, r, uniqueID, q.Get("devicename"), q.Get("salt"), q.Get("clientcert"))
 	case "clientchallenge":
 		s.handlePairClientChallenge(w, r, uniqueID, q.Get("clientchallenge"))
 	case "serverchallengeresp":
@@ -274,14 +274,14 @@ func (s *Server) handlePair(w http.ResponseWriter, r *http.Request) {
 
 // ── Phase 1: getservercert ────────────────────────────────────────────────────
 
-// handlePairGetServerCert returns the server's X.509 certificate and notifies
-// the JetKVM UI to prompt the user for the PIN shown on the Moonlight client.
+// handlePairGetServerCert handles Phase 1 of the Moonlight pairing protocol.
 //
-// The client sends its own certificate and a random salt in this phase.
-// The AES key will be derived in phase 2 once the user has submitted the PIN:
-//
-//	aesKey = SHA256(salt ‖ PIN)[0:16]
-func (s *Server) handlePairGetServerCert(w http.ResponseWriter, uniqueID, deviceName, saltHex, clientCertHex string) {
+// The client sends its certificate and a random salt. The server blocks here
+// (up to 3 minutes) until the user enters the PIN on the JetKVM settings page.
+// The Moonlight client gives Phase 1 a 180-second timeout, so blocking here is
+// safe. Once the PIN is entered the AES key is derived and the server responds
+// with its certificate — Phase 2 can then proceed immediately.
+func (s *Server) handlePairGetServerCert(w http.ResponseWriter, r *http.Request, uniqueID, deviceName, saltHex, clientCertHex string) {
 	log.Info().
 		Str("uniqueID", uniqueID).
 		Str("deviceName", deviceName).
@@ -294,12 +294,8 @@ func (s *Server) handlePairGetServerCert(w http.ResponseWriter, uniqueID, device
 		var err error
 		salt, err = hex.DecodeString(saltHex)
 		if err != nil {
-			log.Warn().Err(err).Str("saltHex", saltHex[:min(len(saltHex), 40)]).Msg("phase1: invalid salt hex; continuing without salt")
-		} else {
-			log.Info().Int("saltLen", len(salt)).Str("saltHex", saltHex[:min(len(saltHex), 40)]).Msg("phase1: decoded salt")
+			log.Warn().Err(err).Msg("phase1: invalid salt hex; continuing without salt")
 		}
-	} else {
-		log.Warn().Msg("phase1: no salt provided by client")
 	}
 
 	state := &pairingState{
@@ -309,48 +305,55 @@ func (s *Server) handlePairGetServerCert(w http.ResponseWriter, uniqueID, device
 		pinCh:      make(chan string, 1),
 	}
 
-	// Save client certificate DER bytes from phase 1 for use in phase 4.
+	// Save client certificate DER bytes for use in phase 4.
 	if clientCertHex != "" {
 		clientCertDER, err := hex.DecodeString(clientCertHex)
 		if err != nil {
-			log.Warn().Err(err).Int("clientCertHexLen", len(clientCertHex)).Msg("phase1: invalid clientcert hex")
+			log.Warn().Err(err).Msg("phase1: invalid clientcert hex")
 		} else {
 			state.clientCertDER = clientCertDER
-			log.Info().Int("derLen", len(clientCertDER)).Msg("phase1: saved client cert DER")
 		}
-	} else {
-		log.Warn().Msg("phase1: no clientcert provided by client")
 	}
 
-	// If the user already entered a PIN in a previous (timed-out) attempt,
-	// carry it forward and re-derive the AES key with the new salt.
+	// If the user already entered a PIN in a previous attempt, carry it
+	// forward and re-derive the AES key with the new salt.
 	activePairingsMu.Lock()
 	if prev, exists := activePairings[uniqueID]; exists && prev.pin != "" {
 		state.pin = prev.pin
 		state.aesKey = pairingAESKey(prev.pin, salt)
-		log.Info().Str("uniqueID", uniqueID).Msg("phase1: reusing PIN from previous attempt — AES key pre-derived")
-	} else if prev, exists := activePairings[uniqueID]; exists {
-		log.Info().Str("uniqueID", uniqueID).Bool("hadPrevState", true).Bool("hadPIN", prev.pin != "").Msg("phase1: previous state existed but no PIN")
+		log.Info().Str("uniqueID", uniqueID).Msg("phase1: reusing PIN from previous attempt")
 	}
 	activePairings[uniqueID] = state
 	activePairingsMu.Unlock()
 
-	// Tell the UI to show a PIN-entry dialog.  The PIN is displayed on the
-	// Moonlight client; the user must type it into the JetKVM web interface.
+	// Notify UI that a pairing request is pending.
 	if s.cfg.PINCallback != nil {
 		go s.cfg.PINCallback(deviceName, uniqueID)
 	}
 
-	// Return server cert as hex-encoded DER (not PEM).
+	// Block until PIN is entered (or pre-derived from a previous attempt).
+	if state.aesKey == nil {
+		log.Info().Str("uniqueID", uniqueID).Msg("phase1: waiting for user to enter PIN on settings page...")
+		select {
+		case pin := <-state.pinCh:
+			state.pin = pin
+			state.aesKey = pairingAESKey(pin, salt)
+			log.Info().Str("uniqueID", uniqueID).Msg("phase1: PIN received, AES key derived")
+		case <-r.Context().Done():
+			log.Info().Str("uniqueID", uniqueID).Msg("phase1: client disconnected while waiting for PIN")
+			return
+		case <-s.ctx.Done():
+			log.Info().Str("uniqueID", uniqueID).Msg("phase1: server shutting down")
+			return
+		}
+	} else {
+		log.Info().Str("uniqueID", uniqueID).Msg("phase1: PIN already available, responding immediately")
+	}
+
+	// Return server cert as hex-encoded DER.
 	s.store.mu.RLock()
 	certPEM := s.store.ServerCertPEM
 	s.store.mu.RUnlock()
-
-	if certPEM == "" {
-		log.Error().Msg("phase1: server cert PEM is empty!")
-		xmlError(w, 500, "internal error: no server cert")
-		return
-	}
 
 	block, _ := pem.Decode([]byte(certPEM))
 	if block == nil {
@@ -360,18 +363,12 @@ func (s *Server) handlePairGetServerCert(w http.ResponseWriter, uniqueID, device
 	}
 	certHex := hex.EncodeToString(block.Bytes)
 
-	resp := fmt.Sprintf(`<paired>1</paired><plaincert>%s</plaincert>`, certHex)
 	log.Info().
 		Str("uniqueID", uniqueID).
-		Str("deviceName", deviceName).
-		Int("saltBytes", len(salt)).
-		Int("clientCertDERBytes", len(state.clientCertDER)).
 		Int("certHexLen", len(certHex)).
-		Bool("hasPreDerivedKey", state.aesKey != nil).
-		Int("responseLen", len(resp)).
 		Msg("phase1: COMPLETE — sending server cert to client")
 
-	xmlOK(w, resp)
+	xmlOK(w, fmt.Sprintf(`<paired>1</paired><plaincert>%s</plaincert>`, certHex))
 }
 
 // ── Phase 2: clientchallenge ──────────────────────────────────────────────────
