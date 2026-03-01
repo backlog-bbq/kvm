@@ -58,6 +58,7 @@ const SecurityAccessLocalAuthRoute = lazy(
 const SettingsMacrosRoute = lazy(() => import("@routes/devices.$id.settings.macros"));
 const SettingsMacrosAddRoute = lazy(() => import("@routes/devices.$id.settings.macros.add"));
 const SettingsMacrosEditRoute = lazy(() => import("@routes/devices.$id.settings.macros.edit"));
+const SettingsMoonlightRoute = lazy(() => import("@routes/devices.$id.settings.moonlight"));
 
 export const isOnDevice = import.meta.env.MODE === "device";
 export const isInCloud = !isOnDevice;
@@ -199,6 +200,10 @@ const getDeviceRoute = (r: Omit<RouteObject, "children" | "index">): RouteObject
               element: <SettingsMacrosEditRoute />,
             },
           ],
+        },
+        {
+          path: "moonlight",
+          element: <SettingsMoonlightRoute />,
         },
       ],
     },

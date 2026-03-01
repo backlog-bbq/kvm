@@ -223,6 +223,7 @@ type pairingState struct {
 	// clientChallengeHash = AES_decrypt(serverchallengeresp) = SHA256(serverResponse ‖ clientCert.Sig)
 	clientChallengeHash []byte
 
+	clientCertDER []byte // client cert DER bytes received in phase 1
 	clientCertPEM string // received in phase 4
 }
 
@@ -249,6 +250,14 @@ func aes128CBCDecrypt(key, ciphertext []byte) ([]byte, error) {
 	mode := cipher.NewCBCDecrypter(block, iv)
 	plaintext := make([]byte, len(ciphertext))
 	mode.CryptBlocks(plaintext, ciphertext)
+	// Strip PKCS#7 padding.
+	if len(plaintext) > 0 {
+		padByte := plaintext[len(plaintext)-1]
+		padLen := int(padByte)
+		if padLen > 0 && padLen <= aes.BlockSize {
+			plaintext = plaintext[:len(plaintext)-padLen]
+		}
+	}
 	return plaintext, nil
 }
 
@@ -258,13 +267,13 @@ func aes128CBCEncrypt(key, plaintext []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Pad to block size.
+	// PKCS#7 padding: always add at least one byte of padding.
 	padLen := aes.BlockSize - (len(plaintext) % aes.BlockSize)
-	if padLen == aes.BlockSize {
-		padLen = 0
-	}
 	padded := make([]byte, len(plaintext)+padLen)
 	copy(padded, plaintext)
+	for i := len(plaintext); i < len(padded); i++ {
+		padded[i] = byte(padLen)
+	}
 
 	iv := make([]byte, aes.BlockSize) // all-zero IV per Moonlight spec
 	mode := cipher.NewCBCEncrypter(block, iv)

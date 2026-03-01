@@ -1,7 +1,9 @@
 package moonlight
 
 import (
+	"crypto"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -229,7 +231,7 @@ func (s *Server) handlePair(w http.ResponseWriter, r *http.Request) {
 
 	switch phase {
 	case "getservercert":
-		s.handlePairGetServerCert(w, uniqueID, q.Get("devicename"), q.Get("salt"))
+		s.handlePairGetServerCert(w, uniqueID, q.Get("devicename"), q.Get("salt"), q.Get("clientcert"))
 	case "clientchallenge":
 		s.handlePairClientChallenge(w, uniqueID, q.Get("clientchallenge"))
 	case "serverchallengeresp":
@@ -256,7 +258,7 @@ func (s *Server) handlePair(w http.ResponseWriter, r *http.Request) {
 // The AES key will be derived in phase 2 once the user has submitted the PIN:
 //
 //	aesKey = SHA256(salt ‖ PIN)[0:16]
-func (s *Server) handlePairGetServerCert(w http.ResponseWriter, uniqueID, deviceName, saltHex string) {
+func (s *Server) handlePairGetServerCert(w http.ResponseWriter, uniqueID, deviceName, saltHex, clientCertHex string) {
 	var salt []byte
 	if saltHex != "" {
 		var err error
@@ -272,6 +274,18 @@ func (s *Server) handlePairGetServerCert(w http.ResponseWriter, uniqueID, device
 		salt:       salt,
 		pinCh:      make(chan string, 1),
 	}
+
+	// Save client certificate DER bytes from phase 1 for use in phase 4.
+	if clientCertHex != "" {
+		clientCertDER, err := hex.DecodeString(clientCertHex)
+		if err != nil {
+			log.Warn().Err(err).Msg("phase1: invalid clientcert hex")
+		} else {
+			state.clientCertDER = clientCertDER
+			log.Debug().Int("len", len(clientCertDER)).Msg("phase1: saved client cert DER")
+		}
+	}
+
 	activePairingsMu.Lock()
 	activePairings[uniqueID] = state
 	activePairingsMu.Unlock()
@@ -282,16 +296,28 @@ func (s *Server) handlePairGetServerCert(w http.ResponseWriter, uniqueID, device
 		go s.cfg.PINCallback(deviceName, uniqueID)
 	}
 
-	certPEM := string(s.store.ServerCertPEMBytes())
+	// Return server cert as hex-encoded DER (not PEM).
+	s.store.mu.RLock()
+	certPEM := s.store.ServerCertPEM
+	s.store.mu.RUnlock()
+
+	block, _ := pem.Decode([]byte(certPEM))
+	if block == nil {
+		log.Error().Msg("phase1: failed to decode server cert PEM")
+		xmlError(w, 500, "internal error")
+		return
+	}
+	certHex := hex.EncodeToString(block.Bytes)
+
 	log.Info().
 		Str("uniqueID", uniqueID).
 		Str("deviceName", deviceName).
 		Bool("hasSalt", len(salt) > 0).
 		Str("saltHex", hex.EncodeToString(salt)).
-		Int("certPEMLen", len(certPEM)).
+		Int("certHexLen", len(certHex)).
 		Msg("phase1 complete: PIN entry required from user — server cert returned to client")
 
-	xmlOK(w, fmt.Sprintf(`<paired>0</paired><plaincert>%s</plaincert>`, certPEM))
+	xmlOK(w, fmt.Sprintf(`<paired>0</paired><plaincert>%s</plaincert>`, certHex))
 }
 
 // ── Phase 2: clientchallenge ──────────────────────────────────────────────────
@@ -457,23 +483,34 @@ func (s *Server) handlePairServerChallengeResp(w http.ResponseWriter, uniqueID, 
 		Str("clientHashHex", hex.EncodeToString(clientHash)).
 		Msg("phase3: stored client challenge hash (will verify in phase 4)")
 
-	// Compute and return our signed secret so the client can verify us:
-	// serverSecret = RSA_sign_SHA256(clientHash ‖ serverCert.Signature, serverKey)
+	// Compute and return our pairing secret:
+	// serverSecret = random 16 bytes
+	// serverSignature = RSA_sign(SHA256(serverSecret ‖ serverCert.Signature))
+	// pairingsecret = hex(serverSecret ‖ serverSignature)
+	serverSecret := make([]byte, 16)
+	if _, err := rand.Read(serverSecret); err != nil {
+		log.Error().Err(err).Msg("phase3: rand.Read failed")
+		xmlError(w, 500, "failed to generate server secret")
+		return
+	}
+
 	s.store.mu.RLock()
 	serverCertSig := s.store.serverCert.Signature
 	s.store.mu.RUnlock()
 
-	toSign := append(append([]byte(nil), clientHash...), serverCertSig...)
-	serverSecret, err := s.store.rsaSignSHA256(toSign)
+	toSign := append(append([]byte(nil), serverSecret...), serverCertSig...)
+	serverSignature, err := s.store.rsaSignSHA256(toSign)
 	if err != nil {
 		log.Error().Err(err).Str("uniqueID", uniqueID).Msg("phase3: RSA sign failed")
 		xmlError(w, 500, "failed to sign server secret")
 		return
 	}
 
+	pairingSecret := append(append([]byte(nil), serverSecret...), serverSignature...)
+
 	log.Info().Str("uniqueID", uniqueID).Msg("phase3 complete: returning signed server secret")
 	xmlOK(w, fmt.Sprintf(`<paired>0</paired><pairingsecret>%s</pairingsecret>`,
-		hex.EncodeToString(serverSecret)))
+		hex.EncodeToString(pairingSecret)))
 }
 
 // ── Phase 4: clientpairingsecret ─────────────────────────────────────────────
@@ -500,47 +537,90 @@ func (s *Server) handlePairClientPairingSecret(w http.ResponseWriter, uniqueID, 
 		Int("secretHexLen", len(clientPairingSecretHex)).
 		Msg("phase4: received clientpairingsecret")
 
-	clientCertBytes, err := hexDecode(clientPairingSecretHex)
+	// clientpairingsecret = hex(clientSecret_16bytes ‖ clientSignature)
+	clientPairingSecretBytes, err := hexDecode(clientPairingSecretHex)
 	if err != nil {
 		log.Warn().Err(err).Str("uniqueID", uniqueID).Msg("phase4: hex decode failed")
 		xmlError(w, 400, "invalid clientpairingsecret hex")
 		return
 	}
+
+	if len(clientPairingSecretBytes) < 16 {
+		log.Warn().Str("uniqueID", uniqueID).Int("len", len(clientPairingSecretBytes)).Msg("phase4: clientpairingsecret too short")
+		xmlError(w, 400, "clientpairingsecret too short")
+		return
+	}
+
+	clientSecret := clientPairingSecretBytes[:16]
+	clientSignature := clientPairingSecretBytes[16:]
+
 	log.Debug().
 		Str("uniqueID", uniqueID).
-		Int("clientCertLen", len(clientCertBytes)).
-		Str("clientCertPrefix", fmt.Sprintf("% x", clientCertBytes[:min(16, len(clientCertBytes))])).
-		Msg("phase4: decoded client cert bytes")
-	state.clientCertPEM = string(clientCertBytes)
+		Int("clientSecretLen", len(clientSecret)).
+		Int("clientSignatureLen", len(clientSignature)).
+		Msg("phase4: parsed client pairing secret")
+
+	// Use the client cert saved from Phase 1.
+	clientCertDER := state.clientCertDER
+	if len(clientCertDER) == 0 {
+		log.Warn().Str("uniqueID", uniqueID).Msg("phase4: no client cert from phase 1")
+		xmlError(w, 400, "missing client certificate from phase 1")
+		return
+	}
+
+	// Verify client signature: RSA_verify(clientPubKey, SHA256(clientSecret ‖ clientCert.Signature), clientSignature)
+	clientCert, parseErr := x509.ParseCertificate(clientCertDER)
+	if parseErr != nil {
+		log.Warn().Err(parseErr).Str("uniqueID", uniqueID).Msg("phase4: could not parse client cert")
+		xmlError(w, 400, "invalid client certificate")
+		return
+	}
+
+	clientSig := clientCert.Signature
+	toVerify := append(append([]byte(nil), clientSecret...), clientSig...)
+	verifyHash := sha256.Sum256(toVerify)
+
+	clientPubKey, ok2 := clientCert.PublicKey.(*rsa.PublicKey)
+	if !ok2 {
+		log.Warn().Str("uniqueID", uniqueID).Msg("phase4: client cert does not have RSA public key")
+		xmlError(w, 400, "client certificate has non-RSA key")
+		return
+	}
+
+	if err := rsa.VerifyPKCS1v15(clientPubKey, crypto.SHA256, verifyHash[:], clientSignature); err != nil {
+		log.Warn().Err(err).Str("uniqueID", uniqueID).Msg("phase4: client signature verification failed")
+		activePairingsMu.Lock()
+		delete(activePairings, uniqueID)
+		activePairingsMu.Unlock()
+		xmlError(w, 403, "client signature verification failed")
+		return
+	}
+	log.Debug().Str("uniqueID", uniqueID).Msg("phase4: client signature verified OK")
 
 	// Verify the phase-3 challenge hash now that we have the client cert signature.
 	if len(state.clientChallengeHash) > 0 && len(state.serverResponse) > 0 {
-		// Parse client cert to extract its Signature bytes.
-		clientSig, parseErr := extractCertSignature(clientCertBytes)
-		if parseErr != nil {
-			log.Warn().Err(parseErr).Str("uniqueID", uniqueID).
-				Msg("phase4: could not parse client cert signature — accepting anyway")
-		} else {
-			expected := sha256.Sum256(append(append([]byte(nil), state.serverResponse...), clientSig...))
-			if len(state.clientChallengeHash) >= 32 {
-				if [32]byte(state.clientChallengeHash[:32]) != expected {
-					log.Warn().
-						Str("uniqueID", uniqueID).
-						Str("got", hex.EncodeToString(state.clientChallengeHash[:32])).
-						Str("expected", hex.EncodeToString(expected[:])).
-						Msg("phase4: client challenge hash mismatch — wrong PIN or tampered exchange")
-					activePairingsMu.Lock()
-					delete(activePairings, uniqueID)
-					activePairingsMu.Unlock()
-					xmlError(w, 403, "challenge verification failed")
-					return
-				}
-				log.Debug().Str("uniqueID", uniqueID).Msg("phase4: client challenge hash verified OK")
+		expected := sha256.Sum256(append(append([]byte(nil), state.serverResponse...), clientSig...))
+		if len(state.clientChallengeHash) >= 32 {
+			if [32]byte(state.clientChallengeHash[:32]) != expected {
+				log.Warn().
+					Str("uniqueID", uniqueID).
+					Str("got", hex.EncodeToString(state.clientChallengeHash[:32])).
+					Str("expected", hex.EncodeToString(expected[:])).
+					Msg("phase4: client challenge hash mismatch — wrong PIN or tampered exchange")
+				activePairingsMu.Lock()
+				delete(activePairings, uniqueID)
+				activePairingsMu.Unlock()
+				xmlError(w, 403, "challenge verification failed")
+				return
 			}
+			log.Debug().Str("uniqueID", uniqueID).Msg("phase4: client challenge hash verified OK")
 		}
 	}
 
-	if err := s.store.StorePairedClient(uniqueID, state.clientCertPEM); err != nil {
+	// Store the client cert from Phase 1 as PEM.
+	clientCertPEM := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: clientCertDER}))
+
+	if err := s.store.StorePairedClient(uniqueID, clientCertPEM); err != nil {
 		log.Error().Err(err).Str("uniqueID", uniqueID).Msg("phase4: failed to save paired client")
 		xmlError(w, 500, "failed to save pairing")
 		return
