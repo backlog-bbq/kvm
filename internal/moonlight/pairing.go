@@ -3,7 +3,6 @@ package moonlight
 import (
 	"crypto"
 	"crypto/aes"
-	"crypto/cipher"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -237,8 +236,9 @@ func pairingAESKey(pin string, salt []byte) []byte {
 	return h.Sum(nil)[:16]
 }
 
-// aes128CBCDecrypt decrypts AES-128-CBC with a zero IV.
-func aes128CBCDecrypt(key, ciphertext []byte) ([]byte, error) {
+// aes128ECBDecrypt decrypts AES-128-ECB with no padding.
+// Moonlight/Sunshine use ECB mode (not CBC) for the pairing protocol.
+func aes128ECBDecrypt(key, ciphertext []byte) ([]byte, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err
@@ -246,39 +246,27 @@ func aes128CBCDecrypt(key, ciphertext []byte) ([]byte, error) {
 	if len(ciphertext)%aes.BlockSize != 0 {
 		return nil, fmt.Errorf("moonlight: ciphertext not a multiple of block size")
 	}
-	iv := make([]byte, aes.BlockSize) // all-zero IV per Moonlight spec
-	mode := cipher.NewCBCDecrypter(block, iv)
 	plaintext := make([]byte, len(ciphertext))
-	mode.CryptBlocks(plaintext, ciphertext)
-	// Strip PKCS#7 padding.
-	if len(plaintext) > 0 {
-		padByte := plaintext[len(plaintext)-1]
-		padLen := int(padByte)
-		if padLen > 0 && padLen <= aes.BlockSize {
-			plaintext = plaintext[:len(plaintext)-padLen]
-		}
+	for i := 0; i < len(ciphertext); i += aes.BlockSize {
+		block.Decrypt(plaintext[i:i+aes.BlockSize], ciphertext[i:i+aes.BlockSize])
 	}
 	return plaintext, nil
 }
 
-// aes128CBCEncrypt encrypts AES-128-CBC with a zero IV.
-func aes128CBCEncrypt(key, plaintext []byte) ([]byte, error) {
+// aes128ECBEncrypt encrypts AES-128-ECB with no padding.
+// Input must be a multiple of 16 bytes. No padding is added.
+func aes128ECBEncrypt(key, plaintext []byte) ([]byte, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err
 	}
-	// PKCS#7 padding: always add at least one byte of padding.
-	padLen := aes.BlockSize - (len(plaintext) % aes.BlockSize)
-	padded := make([]byte, len(plaintext)+padLen)
-	copy(padded, plaintext)
-	for i := len(plaintext); i < len(padded); i++ {
-		padded[i] = byte(padLen)
+	if len(plaintext)%aes.BlockSize != 0 {
+		return nil, fmt.Errorf("moonlight: plaintext not a multiple of block size (%d)", len(plaintext))
 	}
-
-	iv := make([]byte, aes.BlockSize) // all-zero IV per Moonlight spec
-	mode := cipher.NewCBCEncrypter(block, iv)
-	ciphertext := make([]byte, len(padded))
-	mode.CryptBlocks(ciphertext, padded)
+	ciphertext := make([]byte, len(plaintext))
+	for i := 0; i < len(plaintext); i += aes.BlockSize {
+		block.Encrypt(ciphertext[i:i+aes.BlockSize], plaintext[i:i+aes.BlockSize])
+	}
 	return ciphertext, nil
 }
 

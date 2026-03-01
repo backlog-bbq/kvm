@@ -426,7 +426,7 @@ func (s *Server) handlePairClientChallenge(w http.ResponseWriter, r *http.Reques
 		Str("challengeEncHex", hex.EncodeToString(challengeEnc)).
 		Msg("phase2: decrypting client challenge")
 
-	clientData, err := aes128CBCDecrypt(state.aesKey, challengeEnc)
+	clientData, err := aes128ECBDecrypt(state.aesKey, challengeEnc)
 	if err != nil {
 		log.Warn().Err(err).Str("uniqueID", uniqueID).Msg("phase2: AES-CBC decrypt failed — wrong PIN or salt mismatch")
 		xmlError(w, 500, "failed to decrypt client challenge")
@@ -459,7 +459,7 @@ func (s *Server) handlePairClientChallenge(w http.ResponseWriter, r *http.Reques
 
 	// Return AES-CBC(serverResponse ‖ serverChallenge, aesKey)  — 48 bytes.
 	plaintext := append(append([]byte(nil), serverResponse...), serverChallenge...)
-	encrypted, err := aes128CBCEncrypt(state.aesKey, plaintext)
+	encrypted, err := aes128ECBEncrypt(state.aesKey, plaintext)
 	if err != nil {
 		log.Error().Err(err).Str("uniqueID", uniqueID).Msg("phase2: AES-CBC encrypt failed")
 		xmlError(w, 500, "failed to encrypt server challenge")
@@ -519,7 +519,7 @@ func (s *Server) handlePairServerChallengeResp(w http.ResponseWriter, uniqueID, 
 		Str("respEncHex", hex.EncodeToString(respEnc)).
 		Msg("phase3: decrypting serverchallengeresp")
 
-	clientHash, err := aes128CBCDecrypt(state.aesKey, respEnc)
+	clientHash, err := aes128ECBDecrypt(state.aesKey, respEnc)
 	if err != nil {
 		log.Warn().Err(err).Str("uniqueID", uniqueID).Msg("phase3: AES-CBC decrypt failed — wrong PIN or salt mismatch")
 		xmlError(w, 500, "failed to decrypt serverchallengeresp")
