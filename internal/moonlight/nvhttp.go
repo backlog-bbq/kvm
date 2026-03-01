@@ -208,11 +208,26 @@ func (s *Server) handlePair(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	uniqueID := q.Get("uniqueid")
 
-	// Moonlight sends "phrase"; some other implementations send "phase".
-	// Accept both.
+	// Moonlight sends "phrase" for Phase 1 only. Phases 2-4 have NO phrase
+	// parameter — the phase is identified by which data parameter is present.
+	// Some other implementations send "phase" for all phases. We support both.
 	phase := q.Get("phrase")
 	if phase == "" {
 		phase = q.Get("phase")
+	}
+
+	// Auto-detect phase from query parameters when phrase/phase is missing.
+	// Moonlight clients (iOS, Android, Qt) only send phrase=getservercert
+	// for Phase 1 and omit it for Phases 2-4.
+	if phase == "" {
+		switch {
+		case q.Get("clientchallenge") != "":
+			phase = "clientchallenge"
+		case q.Get("serverchallengeresp") != "":
+			phase = "serverchallengeresp"
+		case q.Get("clientpairingsecret") != "":
+			phase = "clientpairingsecret"
+		}
 	}
 
 	if uniqueID == "" {
@@ -225,7 +240,7 @@ func (s *Server) handlePair(w http.ResponseWriter, r *http.Request) {
 		Str("remote", r.RemoteAddr).
 		Bool("tls", r.TLS != nil).
 		Str("uniqueID", uniqueID).
-		Str("phrase", phase).
+		Str("phase", phase).
 		Str("devicename", q.Get("devicename")).
 		Bool("hasSalt", q.Get("salt") != "").
 		Int("saltLen", len(q.Get("salt"))).
@@ -235,7 +250,6 @@ func (s *Server) handlePair(w http.ResponseWriter, r *http.Request) {
 		Bool("hasServerChallengeResp", q.Get("serverchallengeresp") != "").
 		Bool("hasClientPairingSecret", q.Get("clientpairingsecret") != "").
 		Str("fullPath", r.URL.Path).
-		Str("rawQuery", r.URL.RawQuery[:min(len(r.URL.RawQuery), 200)]).
 		Msg("/pair: dispatching pairing phase")
 
 	switch phase {
@@ -250,11 +264,12 @@ func (s *Server) handlePair(w http.ResponseWriter, r *http.Request) {
 		s.handlePairClientPairingSecret(w, uniqueID, q.Get("clientpairingsecret"))
 	default:
 		log.Warn().
-			Str("phrase", phase).
+			Str("phrase", q.Get("phrase")).
+			Str("phase", q.Get("phase")).
 			Str("uniqueID", uniqueID).
-			Str("rawQuery", r.URL.RawQuery).
-			Msg("/pair: unknown or missing phrase parameter — Moonlight uses 'phrase', not 'phase'")
-		xmlError(w, 400, fmt.Sprintf("unknown pairing phrase: %q", phase))
+			Str("rawQuery", r.URL.RawQuery[:min(len(r.URL.RawQuery), 200)]).
+			Msg("/pair: could not determine pairing phase from phrase/phase param or query parameters")
+		xmlError(w, 400, fmt.Sprintf("unknown pairing phase: %q", phase))
 	}
 }
 
