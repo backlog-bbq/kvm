@@ -1,6 +1,7 @@
 package kvm
 
 import (
+	"fmt"
 	"net"
 
 	"github.com/jetkvm/kvm/internal/moonlight"
@@ -46,10 +47,17 @@ func initMoonlight() {
 				return rpcWheelReport(dy)
 			},
 		},
-		PINCallback: func(pin string) {
-			// Emit a JSON-RPC event so the web UI can display the pairing PIN.
-			writeJSONRPCEvent("moonlightPairingPin", map[string]string{"pin": pin}, currentSession)
-			logger.Info().Str("pin", pin).Msg("Moonlight pairing PIN (display to user)")
+		PINCallback: func(deviceName, uniqueID string) {
+			// Emit a JSON-RPC event so the web UI can prompt the user to type
+			// the PIN that is displayed on their Moonlight client.
+			writeJSONRPCEvent("moonlightPairingRequest", map[string]string{
+				"deviceName": deviceName,
+				"uniqueID":   uniqueID,
+			}, currentSession)
+			logger.Info().
+				Str("deviceName", deviceName).
+				Str("uniqueID", uniqueID).
+				Msg("Moonlight pairing requested: waiting for user to enter PIN from client")
 		},
 	})
 	if err != nil {
@@ -64,6 +72,17 @@ func initMoonlight() {
 
 	moonlightServer = srv
 	logger.Info().Msg("Moonlight server initialised")
+}
+
+// rpcSubmitMoonlightPIN is called by the web UI when the user has typed the
+// PIN shown on their Moonlight client. It forwards the PIN to the pending
+// pairing handshake so that the AES session key can be derived and the
+// challenge-response can continue.
+func rpcSubmitMoonlightPIN(uniqueID, pin string) error {
+	if moonlightServer == nil {
+		return fmt.Errorf("Moonlight server is not running")
+	}
+	return moonlightServer.SubmitPIN(uniqueID, pin)
 }
 
 // getMACAddress returns the MAC address of the primary network interface (eth0)

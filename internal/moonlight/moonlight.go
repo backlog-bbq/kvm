@@ -52,9 +52,11 @@ type ServerConfig struct {
 	Hostname string
 	MacAddr  string
 	HID      HIDCallbacks
-	// PINCallback is called when a pairing PIN should be displayed to the user.
-	// The callback receives the 4-digit PIN string.
-	PINCallback func(pin string)
+	// PINCallback is called when a Moonlight client initiates pairing and the
+	// JetKVM UI must prompt the user to enter the PIN shown on the Moonlight
+	// client. The callback receives the connecting device name and its unique ID
+	// (which must be passed back to SubmitPIN).
+	PINCallback func(deviceName, uniqueID string)
 }
 
 // videoFrame holds a single H.264 video frame for delivery to the RTP sender.
@@ -186,6 +188,25 @@ func (s *Server) clearSession() {
 	if s.activeSession != nil {
 		s.activeSession.cancel()
 		s.activeSession = nil
+	}
+}
+
+// SubmitPIN delivers a PIN entered by the user to the pending pairing
+// handshake identified by uniqueID. It returns an error if there is no
+// pending pairing for that uniqueID or if the channel has already been fed.
+func (s *Server) SubmitPIN(uniqueID, pin string) error {
+	activePairingsMu.Lock()
+	state, ok := activePairings[uniqueID]
+	activePairingsMu.Unlock()
+	if !ok {
+		return fmt.Errorf("no pending Moonlight pairing for uniqueID %q", uniqueID)
+	}
+	select {
+	case state.pinCh <- pin:
+		log.Info().Str("uniqueID", uniqueID).Msg("PIN submitted to pairing state")
+		return nil
+	default:
+		return fmt.Errorf("pairing for uniqueID %q is not waiting for a PIN", uniqueID)
 	}
 }
 

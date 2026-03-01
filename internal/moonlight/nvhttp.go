@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 )
 
 // activePairings holds in-progress pairing states keyed by uniqueID.
@@ -197,7 +198,7 @@ func (s *Server) handlePair(w http.ResponseWriter, r *http.Request) {
 
 	switch phase {
 	case "getservercert":
-		s.handlePairGetServerCert(w, uniqueID, q.Get("devicename"))
+		s.handlePairGetServerCert(w, uniqueID, q.Get("devicename"), q.Get("salt"))
 	case "clientchallenge":
 		s.handlePairClientChallenge(w, uniqueID, q.Get("clientchallenge"))
 	case "serverchallengeresp":
@@ -213,36 +214,46 @@ func (s *Server) handlePair(w http.ResponseWriter, r *http.Request) {
 
 // ── Phase 1: getservercert ────────────────────────────────────────────────────
 
-// handlePairGetServerCert returns the server's X.509 certificate and triggers
-// PIN display. The client will use the cert's public key to verify later phases.
-func (s *Server) handlePairGetServerCert(w http.ResponseWriter, uniqueID, deviceName string) {
-	pin, err := generatePIN()
-	if err != nil {
-		log.Error().Err(err).Msg("phase1: failed to generate PIN")
-		xmlError(w, 500, "failed to generate PIN")
-		return
+// handlePairGetServerCert returns the server's X.509 certificate and notifies
+// the JetKVM UI to prompt the user for the PIN shown on the Moonlight client.
+//
+// The client sends its own certificate and a random salt in this phase.
+// The AES key will be derived in phase 2 once the user has submitted the PIN:
+//
+//	aesKey = SHA256(salt ‖ PIN)[0:16]
+func (s *Server) handlePairGetServerCert(w http.ResponseWriter, uniqueID, deviceName, saltHex string) {
+	var salt []byte
+	if saltHex != "" {
+		var err error
+		salt, err = hex.DecodeString(saltHex)
+		if err != nil {
+			log.Warn().Err(err).Str("salt", saltHex).Msg("phase1: invalid salt hex; continuing without salt")
+		}
 	}
 
 	state := &pairingState{
-		uniqueID: uniqueID,
-		pin:      pin,
-		aesKey:   pairingAESKey(pin),
+		uniqueID:   uniqueID,
+		deviceName: deviceName,
+		salt:       salt,
+		pinCh:      make(chan string, 1),
 	}
 	activePairingsMu.Lock()
 	activePairings[uniqueID] = state
 	activePairingsMu.Unlock()
 
+	// Tell the UI to show a PIN-entry dialog.  The PIN is displayed on the
+	// Moonlight client; the user must type it into the JetKVM web interface.
 	if s.cfg.PINCallback != nil {
-		go s.cfg.PINCallback(pin)
+		go s.cfg.PINCallback(deviceName, uniqueID)
 	}
 
 	certPEM := string(s.store.ServerCertPEMBytes())
 	log.Info().
 		Str("uniqueID", uniqueID).
 		Str("deviceName", deviceName).
-		Str("pin", pin).
+		Bool("hasSalt", len(salt) > 0).
 		Int("certPEMLen", len(certPEM)).
-		Msg("phase1 complete: PIN generated, returning server cert")
+		Msg("phase1 complete: waiting for user PIN input, returning server cert")
 
 	xmlOK(w, fmt.Sprintf(`<paired>0</paired><plaincert>%s</plaincert>`, certPEM))
 }
@@ -250,11 +261,9 @@ func (s *Server) handlePairGetServerCert(w http.ResponseWriter, uniqueID, device
 // ── Phase 2: clientchallenge ──────────────────────────────────────────────────
 
 // handlePairClientChallenge processes the client's AES-CBC encrypted random
-// challenge. The server decrypts it, computes a hash that incorporates the
-// server cert's signature bytes and a fresh server challenge, encrypts the
-// result, and returns it so the client can verify the server knows the PIN.
-//
-// Challenge key derivation: key = SHA256(PIN)[0:16], IV = all-zeros.
+// challenge. The server first blocks (up to 120 s) waiting for the user to
+// enter the PIN shown on the Moonlight client. Once received, the AES key is
+// derived as SHA256(salt ‖ PIN)[0:16].
 //
 // Server response plaintext (48 bytes):
 //
@@ -273,7 +282,24 @@ func (s *Server) handlePairClientChallenge(w http.ResponseWriter, uniqueID, chal
 	log.Debug().
 		Str("uniqueID", uniqueID).
 		Int("challengeHexLen", len(challengeHex)).
-		Msg("phase2: received clientchallenge")
+		Msg("phase2: waiting for user PIN input")
+
+	// Block until the user submits the PIN via the JetKVM UI (or timeout).
+	select {
+	case pin := <-state.pinCh:
+		state.aesKey = pairingAESKey(pin, state.salt)
+		log.Info().
+			Str("uniqueID", uniqueID).
+			Bool("hasSalt", len(state.salt) > 0).
+			Msg("phase2: PIN received, AES key derived")
+	case <-time.After(120 * time.Second):
+		log.Warn().Str("uniqueID", uniqueID).Msg("phase2: timed out waiting for PIN")
+		activePairingsMu.Lock()
+		delete(activePairings, uniqueID)
+		activePairingsMu.Unlock()
+		xmlError(w, 408, "timed out waiting for PIN entry")
+		return
+	}
 
 	challengeEnc, err := hexDecode(challengeHex)
 	if err != nil {
