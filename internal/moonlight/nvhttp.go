@@ -34,9 +34,13 @@ func xmlResponse(w http.ResponseWriter, statusCode int, rootContent string) {
 		`<root status_code="%d">%s</root>`, statusCode, rootContent)
 }
 
-func xmlOK(w http.ResponseWriter, content string) { xmlResponse(w, 200, content) }
+func xmlOK(w http.ResponseWriter, content string) {
+	log.Debug().Int("contentLen", len(content)).Msg("xmlOK: sending 200 response")
+	xmlResponse(w, 200, content)
+}
 
 func xmlError(w http.ResponseWriter, code int, msg string) {
+	log.Warn().Int("code", code).Str("msg", msg).Msg("xmlError: sending error response")
 	xmlResponse(w, code, fmt.Sprintf(`<status_message>%s</status_message>`, xmlEsc(msg)))
 }
 
@@ -71,12 +75,12 @@ func (s *Server) nvhttpMux() *http.ServeMux {
 // URL (including query string) so that protocol issues are immediately visible.
 func (s *Server) nvhttpLog(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		log.Debug().
+		log.Info().
 			Str("method", r.Method).
-			Str("path", r.URL.Path).
-			Str("query", r.URL.RawQuery).
+			Str("url", r.URL.String()).
 			Bool("tls", r.TLS != nil).
 			Str("remote", r.RemoteAddr).
+			Str("host", r.Host).
 			Msg("NVHTTP request")
 		h(w, r)
 	}
@@ -112,6 +116,7 @@ func (s *Server) runNVHTTPSServer() {
 		log.Error().Err(err).Msg("NVHTTP HTTPS: failed to parse TLS credentials")
 		return
 	}
+	log.Info().Msg("NVHTTP HTTPS: TLS credentials parsed OK")
 
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{tlsCert},
@@ -223,10 +228,14 @@ func (s *Server) handlePair(w http.ResponseWriter, r *http.Request) {
 		Str("phrase", phase).
 		Str("devicename", q.Get("devicename")).
 		Bool("hasSalt", q.Get("salt") != "").
+		Int("saltLen", len(q.Get("salt"))).
 		Bool("hasClientCert", q.Get("clientcert") != "").
+		Int("clientCertLen", len(q.Get("clientcert"))).
 		Bool("hasClientChallenge", q.Get("clientchallenge") != "").
 		Bool("hasServerChallengeResp", q.Get("serverchallengeresp") != "").
 		Bool("hasClientPairingSecret", q.Get("clientpairingsecret") != "").
+		Str("fullPath", r.URL.Path).
+		Str("rawQuery", r.URL.RawQuery[:min(len(r.URL.RawQuery), 200)]).
 		Msg("/pair: dispatching pairing phase")
 
 	switch phase {
@@ -259,13 +268,24 @@ func (s *Server) handlePair(w http.ResponseWriter, r *http.Request) {
 //
 //	aesKey = SHA256(salt ‖ PIN)[0:16]
 func (s *Server) handlePairGetServerCert(w http.ResponseWriter, uniqueID, deviceName, saltHex, clientCertHex string) {
+	log.Info().
+		Str("uniqueID", uniqueID).
+		Str("deviceName", deviceName).
+		Int("saltHexLen", len(saltHex)).
+		Int("clientCertHexLen", len(clientCertHex)).
+		Msg("phase1: START getservercert")
+
 	var salt []byte
 	if saltHex != "" {
 		var err error
 		salt, err = hex.DecodeString(saltHex)
 		if err != nil {
-			log.Warn().Err(err).Str("salt", saltHex).Msg("phase1: invalid salt hex; continuing without salt")
+			log.Warn().Err(err).Str("saltHex", saltHex[:min(len(saltHex), 40)]).Msg("phase1: invalid salt hex; continuing without salt")
+		} else {
+			log.Info().Int("saltLen", len(salt)).Str("saltHex", saltHex[:min(len(saltHex), 40)]).Msg("phase1: decoded salt")
 		}
+	} else {
+		log.Warn().Msg("phase1: no salt provided by client")
 	}
 
 	state := &pairingState{
@@ -279,11 +299,13 @@ func (s *Server) handlePairGetServerCert(w http.ResponseWriter, uniqueID, device
 	if clientCertHex != "" {
 		clientCertDER, err := hex.DecodeString(clientCertHex)
 		if err != nil {
-			log.Warn().Err(err).Msg("phase1: invalid clientcert hex")
+			log.Warn().Err(err).Int("clientCertHexLen", len(clientCertHex)).Msg("phase1: invalid clientcert hex")
 		} else {
 			state.clientCertDER = clientCertDER
-			log.Debug().Int("len", len(clientCertDER)).Msg("phase1: saved client cert DER")
+			log.Info().Int("derLen", len(clientCertDER)).Msg("phase1: saved client cert DER")
 		}
+	} else {
+		log.Warn().Msg("phase1: no clientcert provided by client")
 	}
 
 	// If the user already entered a PIN in a previous (timed-out) attempt,
@@ -292,7 +314,9 @@ func (s *Server) handlePairGetServerCert(w http.ResponseWriter, uniqueID, device
 	if prev, exists := activePairings[uniqueID]; exists && prev.pin != "" {
 		state.pin = prev.pin
 		state.aesKey = pairingAESKey(prev.pin, salt)
-		log.Info().Str("uniqueID", uniqueID).Msg("phase1: reusing PIN from previous attempt")
+		log.Info().Str("uniqueID", uniqueID).Msg("phase1: reusing PIN from previous attempt — AES key pre-derived")
+	} else if prev, exists := activePairings[uniqueID]; exists {
+		log.Info().Str("uniqueID", uniqueID).Bool("hadPrevState", true).Bool("hadPIN", prev.pin != "").Msg("phase1: previous state existed but no PIN")
 	}
 	activePairings[uniqueID] = state
 	activePairingsMu.Unlock()
@@ -308,6 +332,12 @@ func (s *Server) handlePairGetServerCert(w http.ResponseWriter, uniqueID, device
 	certPEM := s.store.ServerCertPEM
 	s.store.mu.RUnlock()
 
+	if certPEM == "" {
+		log.Error().Msg("phase1: server cert PEM is empty!")
+		xmlError(w, 500, "internal error: no server cert")
+		return
+	}
+
 	block, _ := pem.Decode([]byte(certPEM))
 	if block == nil {
 		log.Error().Msg("phase1: failed to decode server cert PEM")
@@ -316,15 +346,18 @@ func (s *Server) handlePairGetServerCert(w http.ResponseWriter, uniqueID, device
 	}
 	certHex := hex.EncodeToString(block.Bytes)
 
+	resp := fmt.Sprintf(`<paired>1</paired><plaincert>%s</plaincert>`, certHex)
 	log.Info().
 		Str("uniqueID", uniqueID).
 		Str("deviceName", deviceName).
-		Bool("hasSalt", len(salt) > 0).
-		Str("saltHex", hex.EncodeToString(salt)).
+		Int("saltBytes", len(salt)).
+		Int("clientCertDERBytes", len(state.clientCertDER)).
 		Int("certHexLen", len(certHex)).
-		Msg("phase1 complete: PIN entry required from user — server cert returned to client")
+		Bool("hasPreDerivedKey", state.aesKey != nil).
+		Int("responseLen", len(resp)).
+		Msg("phase1: COMPLETE — sending server cert to client")
 
-	xmlOK(w, fmt.Sprintf(`<paired>1</paired><plaincert>%s</plaincert>`, certHex))
+	xmlOK(w, resp)
 }
 
 // ── Phase 2: clientchallenge ──────────────────────────────────────────────────
