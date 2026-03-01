@@ -317,7 +317,7 @@ func (s *Server) handlePairGetServerCert(w http.ResponseWriter, uniqueID, device
 		Int("certHexLen", len(certHex)).
 		Msg("phase1 complete: PIN entry required from user — server cert returned to client")
 
-	xmlOK(w, fmt.Sprintf(`<paired>0</paired><plaincert>%s</plaincert>`, certHex))
+	xmlOK(w, fmt.Sprintf(`<paired>1</paired><plaincert>%s</plaincert>`, certHex))
 }
 
 // ── Phase 2: clientchallenge ──────────────────────────────────────────────────
@@ -423,7 +423,7 @@ func (s *Server) handlePairClientChallenge(w http.ResponseWriter, uniqueID, chal
 		Str("encryptedHex", hex.EncodeToString(encrypted)).
 		Msg("phase2 complete: returning encrypted server challenge+response")
 
-	xmlOK(w, fmt.Sprintf(`<paired>0</paired><challenge>%s</challenge>`,
+	xmlOK(w, fmt.Sprintf(`<paired>1</paired><challenge>%s</challenge>`,
 		hex.EncodeToString(encrypted)))
 }
 
@@ -509,7 +509,7 @@ func (s *Server) handlePairServerChallengeResp(w http.ResponseWriter, uniqueID, 
 	pairingSecret := append(append([]byte(nil), serverSecret...), serverSignature...)
 
 	log.Info().Str("uniqueID", uniqueID).Msg("phase3 complete: returning signed server secret")
-	xmlOK(w, fmt.Sprintf(`<paired>0</paired><pairingsecret>%s</pairingsecret>`,
+	xmlOK(w, fmt.Sprintf(`<paired>1</paired><pairingsecret>%s</pairingsecret>`,
 		hex.EncodeToString(pairingSecret)))
 }
 
