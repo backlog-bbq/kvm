@@ -131,8 +131,18 @@ func (s *Server) runNVHTTPSServer() {
 		// Moonlight clients present their paired certificate during TLS handshake.
 		// RequestClientCert asks for a cert but doesn't require/verify it at the
 		// TLS layer — verification is done at the application level via IsPaired().
-		// Without this, Moonlight resets the connection during handshake.
 		ClientAuth: tls.RequestClientCert,
+		// Disable HTTP/2 — Moonlight clients expect HTTP/1.1 only.
+		NextProtos: []string{"http/1.1"},
+		// Log TLS ClientHello details for debugging handshake failures.
+		GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+			log.Info().
+				Str("serverName", hello.ServerName).
+				Int("numCipherSuites", len(hello.CipherSuites)).
+				Strs("alpn", hello.SupportedProtos).
+				Msg("NVHTTP HTTPS: TLS ClientHello received")
+			return nil, nil // use default config
+		},
 	}
 
 	addr := fmt.Sprintf(":%d", NVHTTPSPort)
@@ -140,6 +150,9 @@ func (s *Server) runNVHTTPSServer() {
 		Addr:      addr,
 		Handler:   s.nvhttpMux(),
 		TLSConfig: tlsConfig,
+		// Explicitly disable HTTP/2 — Go auto-enables it for TLS servers,
+		// but Moonlight clients only speak HTTP/1.1.
+		TLSNextProto: make(map[string]func(*http.Server, *tls.Conn, http.Handler)),
 	}
 
 	log.Info().Str("addr", addr).Msg("NVHTTP HTTPS server listening")
