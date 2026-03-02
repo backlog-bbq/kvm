@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/pem"
@@ -103,15 +104,43 @@ func (s *Server) runNVHTTPServer() {
 	}
 }
 
-// runNVHTTPSServer starts a plain HTTP server on port 47984.
-// Moonlight iOS sends plain HTTP (not HTTPS) to this port for authenticated
-// endpoints like /launch and /resume. We serve the same mux as port 47989.
+// runNVHTTPSServer starts the TLS server on port 47984 using the server's
+// self-signed certificate. Moonlight uses this port for authenticated
+// endpoints (/launch, /resume, /applist) after pairing.
 func (s *Server) runNVHTTPSServer() {
+	s.store.mu.RLock()
+	certPEM := s.store.ServerCertPEM
+	keyPEM := s.store.ServerKeyPEM
+	s.store.mu.RUnlock()
+
+	if certPEM == "" || keyPEM == "" {
+		log.Error().Msg("NVHTTP HTTPS: server cert/key not available, skipping TLS listener")
+		return
+	}
+
+	tlsCert, err := tls.X509KeyPair([]byte(certPEM), []byte(keyPEM))
+	if err != nil {
+		log.Error().Err(err).Msg("NVHTTP HTTPS: failed to parse TLS credentials")
+		return
+	}
+
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{tlsCert},
+		MinVersion:   tls.VersionTLS10,
+		ClientAuth:   tls.NoClientCert,
+	}
+
 	addr := fmt.Sprintf(":%d", NVHTTPSPort)
-	srv := &http.Server{Addr: addr, Handler: s.nvhttpMux()}
-	log.Info().Str("addr", addr).Msg("NVHTTP port 47984 server listening (plain HTTP)")
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Error().Err(err).Msg("NVHTTP port 47984 server error")
+	srv := &http.Server{
+		Addr:         addr,
+		Handler:      s.nvhttpMux(),
+		TLSConfig:    tlsConfig,
+		TLSNextProto: make(map[string]func(*http.Server, *tls.Conn, http.Handler)),
+	}
+
+	log.Info().Str("addr", addr).Msg("NVHTTP HTTPS server listening")
+	if err := srv.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+		log.Error().Err(err).Msg("NVHTTP HTTPS server error")
 	}
 }
 
