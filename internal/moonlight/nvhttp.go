@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
-	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/pem"
@@ -104,132 +103,17 @@ func (s *Server) runNVHTTPServer() {
 	}
 }
 
-// runNVHTTPSServer starts a dual-protocol server on port 47984 that handles
-// both TLS and plain HTTP connections. When a connection arrives, we peek at the
-// first byte: if it looks like a TLS ClientHello (0x16), we do TLS; otherwise
-// we treat it as plain HTTP. This is necessary because different Moonlight
-// client versions (iOS, Android, Qt) may or may not use TLS on this port.
+// runNVHTTPSServer starts a plain HTTP server on port 47984.
+// Moonlight iOS sends plain HTTP (not HTTPS) to this port for authenticated
+// endpoints like /launch and /resume. We serve the same mux as port 47989.
 func (s *Server) runNVHTTPSServer() {
-	s.store.mu.RLock()
-	certPEM := s.store.ServerCertPEM
-	keyPEM := s.store.ServerKeyPEM
-	s.store.mu.RUnlock()
-
-	if certPEM == "" || keyPEM == "" {
-		log.Error().Msg("NVHTTP HTTPS: server cert/key not available, skipping listener")
-		return
-	}
-
-	tlsCert, err := tls.X509KeyPair([]byte(certPEM), []byte(keyPEM))
-	if err != nil {
-		log.Error().Err(err).Msg("NVHTTP HTTPS: failed to parse TLS credentials")
-		return
-	}
-
-	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{tlsCert},
-		MinVersion:   tls.VersionTLS10,
-		ClientAuth:   tls.NoClientCert,
-		NextProtos:   []string{"http/1.1"},
-	}
-
 	addr := fmt.Sprintf(":%d", NVHTTPSPort)
-	ln, err := net.Listen("tcp4", addr)
-	if err != nil {
-		log.Error().Err(err).Str("addr", addr).Msg("NVHTTP HTTPS: failed to listen")
-		return
-	}
-	defer ln.Close()
-
-	handler := s.nvhttpMux()
-
-	log.Info().Str("addr", addr).Msg("NVHTTP HTTPS server listening (TLS + plain HTTP)")
-
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			if s.ctx.Err() != nil {
-				return
-			}
-			log.Warn().Err(err).Msg("NVHTTP HTTPS: accept error")
-			continue
-		}
-		go s.handleDualConn(conn, tlsConfig, handler)
+	srv := &http.Server{Addr: addr, Handler: s.nvhttpMux()}
+	log.Info().Str("addr", addr).Msg("NVHTTP port 47984 server listening (plain HTTP)")
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Error().Err(err).Msg("NVHTTP port 47984 server error")
 	}
 }
-
-// handleDualConn peeks at the first byte of a connection to determine if it's
-// TLS (byte 0x16 = TLS handshake record) or plain HTTP, then serves accordingly.
-func (s *Server) handleDualConn(conn net.Conn, tlsConfig *tls.Config, handler http.Handler) {
-	defer conn.Close()
-
-	// Peek at the first byte without consuming it.
-	buf := make([]byte, 1)
-	n, err := conn.Read(buf)
-	if err != nil || n == 0 {
-		log.Debug().Err(err).Msg("NVHTTP HTTPS: failed to peek first byte")
-		return
-	}
-
-	// Wrap the connection so the peeked byte is replayed.
-	peeked := &prefixConn{prefix: buf[:n], Conn: conn}
-
-	if buf[0] == 0x16 {
-		// TLS ClientHello record type
-		log.Debug().Str("remote", conn.RemoteAddr().String()).Msg("NVHTTP HTTPS: TLS connection detected")
-		tlsConn := tls.Server(peeked, tlsConfig)
-		defer tlsConn.Close()
-		if err := tlsConn.Handshake(); err != nil {
-			log.Warn().Err(err).Str("remote", conn.RemoteAddr().String()).Msg("NVHTTP HTTPS: TLS handshake failed")
-			return
-		}
-		// Serve HTTP over the TLS connection.
-		srv := &http.Server{Handler: handler}
-		srv.ConnState = func(_ net.Conn, _ http.ConnState) {} // no-op
-		_ = http.Serve(newSingleConnListener(tlsConn), handler)
-	} else {
-		// Plain HTTP
-		log.Debug().Str("remote", conn.RemoteAddr().String()).Msg("NVHTTP HTTPS: plain HTTP connection detected")
-		_ = http.Serve(newSingleConnListener(peeked), handler)
-	}
-}
-
-// prefixConn replays prefix bytes before reading from the underlying connection.
-type prefixConn struct {
-	prefix []byte
-	net.Conn
-}
-
-func (c *prefixConn) Read(b []byte) (int, error) {
-	if len(c.prefix) > 0 {
-		n := copy(b, c.prefix)
-		c.prefix = c.prefix[n:]
-		return n, nil
-	}
-	return c.Conn.Read(b)
-}
-
-// singleConnListener is a net.Listener that returns a single connection then EOF.
-type singleConnListener struct {
-	conn net.Conn
-	addr net.Addr
-	done bool
-}
-
-func newSingleConnListener(c net.Conn) *singleConnListener {
-	return &singleConnListener{conn: c, addr: c.LocalAddr()}
-}
-
-func (l *singleConnListener) Accept() (net.Conn, error) {
-	if !l.done {
-		l.done = true
-		return l.conn, nil
-	}
-	return nil, fmt.Errorf("listener closed")
-}
-
-func (l *singleConnListener) Close() error   { return nil }
-func (l *singleConnListener) Addr() net.Addr { return l.addr }
 
 // ── /serverinfo ───────────────────────────────────────────────────────────────
 
