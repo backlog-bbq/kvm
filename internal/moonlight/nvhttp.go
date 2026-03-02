@@ -43,6 +43,13 @@ func xmlError(w http.ResponseWriter, code int, msg string) {
 	xmlResponse(w, code, fmt.Sprintf(`<status_message>%s</status_message>`, xmlEsc(msg)))
 }
 
+// xmlPairFail returns a pairing failure response — always HTTP 200 with paired=0.
+// Sunshine always returns 200 for pairing responses; non-200 causes "server error" in clients.
+func xmlPairFail(w http.ResponseWriter, msg string) {
+	log.Warn().Str("msg", msg).Msg("pairing failed")
+	xmlOK(w, `<paired>0</paired>`)
+}
+
 // xmlEsc escapes the five XML special characters so the string is safe inside
 // an element's text content or attribute value.
 func xmlEsc(s string) string {
@@ -393,7 +400,7 @@ func (s *Server) handlePairClientChallenge(w http.ResponseWriter, r *http.Reques
 	activePairingsMu.Unlock()
 	if !ok {
 		log.Warn().Str("uniqueID", uniqueID).Msg("phase2: no pending pairing state")
-		xmlError(w, 400, "no pending pairing for this uniqueid; start from phase 1")
+		xmlPairFail(w, "no pending pairing for this uniqueid; start from phase 1")
 		return
 	}
 
@@ -409,7 +416,7 @@ func (s *Server) handlePairClientChallenge(w http.ResponseWriter, r *http.Reques
 	// forward and Phase 2 will respond immediately on the next attempt.
 	if state.aesKey == nil {
 		log.Info().Str("uniqueID", uniqueID).Msg("phase2: PIN not yet entered — returning paired=0 so client can retry after PIN entry")
-		xmlOK(w, `<paired>0</paired>`)
+		xmlPairFail(w, "PIN not yet entered")
 		return
 	}
 	log.Info().Str("uniqueID", uniqueID).Msg("phase2: PIN available, responding immediately")
@@ -417,7 +424,7 @@ func (s *Server) handlePairClientChallenge(w http.ResponseWriter, r *http.Reques
 	challengeEnc, err := hexDecode(challengeHex)
 	if err != nil {
 		log.Warn().Err(err).Str("uniqueID", uniqueID).Msg("phase2: hex decode failed")
-		xmlError(w, 400, "invalid clientchallenge hex")
+		xmlPairFail(w, "invalid clientchallenge hex")
 		return
 	}
 
@@ -428,8 +435,8 @@ func (s *Server) handlePairClientChallenge(w http.ResponseWriter, r *http.Reques
 
 	clientData, err := aes128ECBDecrypt(state.aesKey, challengeEnc)
 	if err != nil {
-		log.Warn().Err(err).Str("uniqueID", uniqueID).Msg("phase2: AES-CBC decrypt failed — wrong PIN or salt mismatch")
-		xmlError(w, 500, "failed to decrypt client challenge")
+		log.Warn().Err(err).Str("uniqueID", uniqueID).Msg("phase2: AES-ECB decrypt failed — wrong PIN or salt mismatch")
+		xmlPairFail(w, "failed to decrypt client challenge")
 		return
 	}
 	log.Debug().
@@ -444,12 +451,12 @@ func (s *Server) handlePairClientChallenge(w http.ResponseWriter, r *http.Reques
 	serverChallenge := make([]byte, 16)
 	if _, err := rand.Read(serverSecret); err != nil {
 		log.Error().Err(err).Msg("phase2: rand.Read failed")
-		xmlError(w, 500, "internal error")
+		xmlPairFail(w, "internal error")
 		return
 	}
 	if _, err := rand.Read(serverChallenge); err != nil {
 		log.Error().Err(err).Msg("phase2: rand.Read failed")
-		xmlError(w, 500, "internal error")
+		xmlPairFail(w, "internal error")
 		return
 	}
 	state.serverSecret = serverSecret
@@ -473,7 +480,7 @@ func (s *Server) handlePairClientChallenge(w http.ResponseWriter, r *http.Reques
 	encrypted, err := aes128ECBEncrypt(state.aesKey, plaintext)
 	if err != nil {
 		log.Error().Err(err).Str("uniqueID", uniqueID).Msg("phase2: AES-ECB encrypt failed")
-		xmlError(w, 500, "failed to encrypt server challenge")
+		xmlPairFail(w, "failed to encrypt server challenge")
 		return
 	}
 
@@ -507,7 +514,7 @@ func (s *Server) handlePairServerChallengeResp(w http.ResponseWriter, uniqueID, 
 	activePairingsMu.Unlock()
 	if !ok {
 		log.Warn().Str("uniqueID", uniqueID).Msg("phase3: no pending pairing state")
-		xmlError(w, 400, "no pending pairing for this uniqueid; start from phase 1")
+		xmlPairFail(w, "no pending pairing for this uniqueid; start from phase 1")
 		return
 	}
 
@@ -520,7 +527,7 @@ func (s *Server) handlePairServerChallengeResp(w http.ResponseWriter, uniqueID, 
 	respEnc, err := hexDecode(serverChallengeRespHex)
 	if err != nil {
 		log.Warn().Err(err).Str("uniqueID", uniqueID).Msg("phase3: hex decode of serverchallengeresp failed")
-		xmlError(w, 400, "invalid serverchallengeresp hex")
+		xmlPairFail(w, "invalid serverchallengeresp hex")
 		return
 	}
 
@@ -532,8 +539,8 @@ func (s *Server) handlePairServerChallengeResp(w http.ResponseWriter, uniqueID, 
 
 	clientHash, err := aes128ECBDecrypt(state.aesKey, respEnc)
 	if err != nil {
-		log.Warn().Err(err).Str("uniqueID", uniqueID).Msg("phase3: AES-CBC decrypt failed — wrong PIN or salt mismatch")
-		xmlError(w, 500, "failed to decrypt serverchallengeresp")
+		log.Warn().Err(err).Str("uniqueID", uniqueID).Msg("phase3: AES-ECB decrypt failed — wrong PIN or salt mismatch")
+		xmlPairFail(w, "failed to decrypt serverchallengeresp")
 		return
 	}
 
@@ -553,14 +560,14 @@ func (s *Server) handlePairServerChallengeResp(w http.ResponseWriter, uniqueID, 
 	serverSecret := state.serverSecret
 	if len(serverSecret) == 0 {
 		log.Error().Str("uniqueID", uniqueID).Msg("phase3: no serverSecret from Phase 2")
-		xmlError(w, 500, "internal error: missing server secret")
+		xmlPairFail(w, "internal error: missing server secret")
 		return
 	}
 
 	serverSignature, err := s.store.rsaSignSHA256(serverSecret)
 	if err != nil {
 		log.Error().Err(err).Str("uniqueID", uniqueID).Msg("phase3: RSA sign failed")
-		xmlError(w, 500, "failed to sign server secret")
+		xmlPairFail(w, "failed to sign server secret")
 		return
 	}
 
@@ -573,20 +580,23 @@ func (s *Server) handlePairServerChallengeResp(w http.ResponseWriter, uniqueID, 
 
 // ── Phase 4: clientpairingsecret ─────────────────────────────────────────────
 
-// handlePairClientPairingSecret receives the client's X.509 certificate (hex PEM),
-// verifies the phase-3 hash, and — if valid — stores the client as paired.
+// handlePairClientPairingSecret receives the client's pairing secret
+// (clientSecret ‖ RSA signature) and verifies it against the stored
+// Phase 3 client hash. On success, stores the client cert as paired.
 //
-// Verification:
+// Verification (matching Sunshine):
 //
-//	expected = SHA256(state.serverResponse ‖ clientCert.Signature)
-//	assert expected == state.clientChallengeHash
+//  1. Cross-check: SHA256(serverChallenge ‖ clientCert.Signature ‖ clientSecret) == clientHash
+//  2. RSA verify:  RSA_verify(clientPubKey, SHA256(clientSecret), clientSignature)
+//
+// Always returns HTTP 200 with paired=1 or paired=0 (Sunshine convention).
 func (s *Server) handlePairClientPairingSecret(w http.ResponseWriter, uniqueID, clientPairingSecretHex string) {
 	activePairingsMu.Lock()
 	state, ok := activePairings[uniqueID]
 	activePairingsMu.Unlock()
 	if !ok {
 		log.Warn().Str("uniqueID", uniqueID).Msg("phase4: no pending pairing state")
-		xmlError(w, 400, "no pending pairing for this uniqueid; start from phase 1")
+		xmlPairFail(w, "no pending pairing for this uniqueid")
 		return
 	}
 
@@ -595,17 +605,24 @@ func (s *Server) handlePairClientPairingSecret(w http.ResponseWriter, uniqueID, 
 		Int("secretHexLen", len(clientPairingSecretHex)).
 		Msg("phase4: received clientpairingsecret")
 
+	// Always clean up session state when done.
+	defer func() {
+		activePairingsMu.Lock()
+		delete(activePairings, uniqueID)
+		activePairingsMu.Unlock()
+	}()
+
 	// clientpairingsecret = hex(clientSecret_16bytes ‖ clientSignature)
 	clientPairingSecretBytes, err := hexDecode(clientPairingSecretHex)
 	if err != nil {
 		log.Warn().Err(err).Str("uniqueID", uniqueID).Msg("phase4: hex decode failed")
-		xmlError(w, 400, "invalid clientpairingsecret hex")
+		xmlPairFail(w, "invalid clientpairingsecret hex")
 		return
 	}
 
-	if len(clientPairingSecretBytes) < 16 {
+	if len(clientPairingSecretBytes) <= 16 {
 		log.Warn().Str("uniqueID", uniqueID).Int("len", len(clientPairingSecretBytes)).Msg("phase4: clientpairingsecret too short")
-		xmlError(w, 400, "clientpairingsecret too short")
+		xmlPairFail(w, "clientpairingsecret too short")
 		return
 	}
 
@@ -622,50 +639,73 @@ func (s *Server) handlePairClientPairingSecret(w http.ResponseWriter, uniqueID, 
 	clientCertDER := state.clientCertDER
 	if len(clientCertDER) == 0 {
 		log.Warn().Str("uniqueID", uniqueID).Msg("phase4: no client cert from phase 1")
-		xmlError(w, 400, "missing client certificate from phase 1")
+		xmlPairFail(w, "missing client certificate from phase 1")
 		return
 	}
 
-	// Verify client signature: RSA_verify(clientPubKey, SHA256(clientSecret), clientSignature)
-	// The Moonlight client signs just the secret — cert signature is NOT included.
 	clientCert, parseErr := x509.ParseCertificate(clientCertDER)
 	if parseErr != nil {
 		log.Warn().Err(parseErr).Str("uniqueID", uniqueID).Msg("phase4: could not parse client cert")
-		xmlError(w, 400, "invalid client certificate")
+		xmlPairFail(w, "invalid client certificate")
 		return
 	}
-
-	verifyHash := sha256.Sum256(clientSecret)
 
 	clientPubKey, ok2 := clientCert.PublicKey.(*rsa.PublicKey)
 	if !ok2 {
 		log.Warn().Str("uniqueID", uniqueID).Msg("phase4: client cert does not have RSA public key")
-		xmlError(w, 400, "client certificate has non-RSA key")
+		xmlPairFail(w, "client certificate has non-RSA key")
 		return
 	}
 
-	if err := rsa.VerifyPKCS1v15(clientPubKey, crypto.SHA256, verifyHash[:], clientSignature); err != nil {
-		log.Warn().Err(err).Str("uniqueID", uniqueID).Msg("phase4: client signature verification failed")
-		activePairingsMu.Lock()
-		delete(activePairings, uniqueID)
-		activePairingsMu.Unlock()
-		xmlError(w, 403, "client signature verification failed")
+	// Cross-check: SHA256(serverChallenge ‖ clientCert.Signature ‖ clientSecret) must match
+	// the clientHash we stored from Phase 3 (the decrypted serverchallengeresp).
+	h := sha256.New()
+	h.Write(state.serverChallenge)
+	h.Write(clientCert.Signature)
+	h.Write(clientSecret)
+	expectedHash := h.Sum(nil)
+
+	sameHash := len(expectedHash) == len(state.clientChallengeHash) &&
+		len(expectedHash) > 0
+	if sameHash {
+		for i := range expectedHash {
+			if expectedHash[i] != state.clientChallengeHash[i] {
+				sameHash = false
+				break
+			}
+		}
+	}
+
+	// Verify client signature: RSA_verify(clientPubKey, SHA256(clientSecret), clientSignature)
+	verifyHash := sha256.Sum256(clientSecret)
+	sigOK := rsa.VerifyPKCS1v15(clientPubKey, crypto.SHA256, verifyHash[:], clientSignature) == nil
+
+	log.Info().
+		Str("uniqueID", uniqueID).
+		Bool("sameHash", sameHash).
+		Bool("sigOK", sigOK).
+		Msg("phase4: verification results")
+
+	if !sameHash || !sigOK {
+		log.Warn().
+			Str("uniqueID", uniqueID).
+			Bool("sameHash", sameHash).
+			Bool("sigOK", sigOK).
+			Str("expectedHashHex", hex.EncodeToString(expectedHash)).
+			Str("clientHashHex", hex.EncodeToString(state.clientChallengeHash)).
+			Msg("phase4: verification failed")
+		xmlPairFail(w, "client verification failed")
 		return
 	}
-	log.Info().Str("uniqueID", uniqueID).Msg("phase4: client signature verified OK")
 
 	// Store the client cert from Phase 1 as PEM.
 	clientCertPEM := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: clientCertDER}))
 
 	if err := s.store.StorePairedClient(uniqueID, clientCertPEM); err != nil {
 		log.Error().Err(err).Str("uniqueID", uniqueID).Msg("phase4: failed to save paired client")
-		xmlError(w, 500, "failed to save pairing")
+		xmlPairFail(w, "failed to save pairing")
 		return
 	}
-
-	activePairingsMu.Lock()
-	delete(activePairings, uniqueID)
-	activePairingsMu.Unlock()
 
 	log.Info().Str("uniqueID", uniqueID).Msg("phase4 complete: pairing succeeded")
 	xmlOK(w, `<paired>1</paired>`)
