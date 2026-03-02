@@ -317,13 +317,23 @@ func (s *Server) handlePairGetServerCert(w http.ResponseWriter, r *http.Request,
 		pinCh:      make(chan string, 1),
 	}
 
-	// Save client certificate DER bytes for use in phase 4.
+	// Save client certificate bytes for use in phase 4.
+	// Moonlight sends hex-encoded PEM, so hex-decode gives PEM bytes.
+	// We parse the PEM to extract DER for later x509.ParseCertificate().
 	if clientCertHex != "" {
-		clientCertDER, err := hex.DecodeString(clientCertHex)
+		clientCertBytes, err := hex.DecodeString(clientCertHex)
 		if err != nil {
 			log.Warn().Err(err).Msg("phase1: invalid clientcert hex")
 		} else {
-			state.clientCertDER = clientCertDER
+			// Try PEM decode first (Moonlight Qt/iOS send PEM).
+			if block, _ := pem.Decode(clientCertBytes); block != nil {
+				state.clientCertDER = block.Bytes
+				log.Info().Int("derLen", len(block.Bytes)).Msg("phase1: parsed client cert PEM → DER")
+			} else {
+				// Fall back to treating it as raw DER.
+				state.clientCertDER = clientCertBytes
+				log.Info().Int("derLen", len(clientCertBytes)).Msg("phase1: treating client cert as raw DER")
+			}
 		}
 	}
 
