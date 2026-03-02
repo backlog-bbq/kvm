@@ -104,17 +104,19 @@ func (s *Server) runNVHTTPServer() {
 	}
 }
 
-// runNVHTTPSServer starts the TLS server on port 47984 using the server's
-// self-signed certificate. Moonlight sends ALL /pair requests here.
+// runNVHTTPSServer starts a dual-protocol server on port 47984 that handles
+// both TLS and plain HTTP connections. When a connection arrives, we peek at the
+// first byte: if it looks like a TLS ClientHello (0x16), we do TLS; otherwise
+// we treat it as plain HTTP. This is necessary because different Moonlight
+// client versions (iOS, Android, Qt) may or may not use TLS on this port.
 func (s *Server) runNVHTTPSServer() {
-	// Load key + cert from the pairing store (generated at startup).
 	s.store.mu.RLock()
 	certPEM := s.store.ServerCertPEM
 	keyPEM := s.store.ServerKeyPEM
 	s.store.mu.RUnlock()
 
 	if certPEM == "" || keyPEM == "" {
-		log.Error().Msg("NVHTTP HTTPS: server cert/key not available, skipping TLS listener")
+		log.Error().Msg("NVHTTP HTTPS: server cert/key not available, skipping listener")
 		return
 	}
 
@@ -123,44 +125,111 @@ func (s *Server) runNVHTTPSServer() {
 		log.Error().Err(err).Msg("NVHTTP HTTPS: failed to parse TLS credentials")
 		return
 	}
-	log.Info().Msg("NVHTTP HTTPS: TLS credentials parsed OK")
 
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{tlsCert},
 		MinVersion:   tls.VersionTLS10,
-		// Moonlight clients present their paired certificate during TLS handshake.
-		// RequestClientCert asks for a cert but doesn't require/verify it at the
-		// TLS layer — verification is done at the application level via IsPaired().
-		ClientAuth: tls.RequestClientCert,
-		// Disable HTTP/2 — Moonlight clients expect HTTP/1.1 only.
-		NextProtos: []string{"http/1.1"},
-		// Log TLS ClientHello details for debugging handshake failures.
-		GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
-			log.Info().
-				Str("serverName", hello.ServerName).
-				Int("numCipherSuites", len(hello.CipherSuites)).
-				Strs("alpn", hello.SupportedProtos).
-				Msg("NVHTTP HTTPS: TLS ClientHello received")
-			return nil, nil // use default config
-		},
+		ClientAuth:   tls.NoClientCert,
+		NextProtos:   []string{"http/1.1"},
 	}
 
 	addr := fmt.Sprintf(":%d", NVHTTPSPort)
-	srv := &http.Server{
-		Addr:      addr,
-		Handler:   s.nvhttpMux(),
-		TLSConfig: tlsConfig,
-		// Explicitly disable HTTP/2 — Go auto-enables it for TLS servers,
-		// but Moonlight clients only speak HTTP/1.1.
-		TLSNextProto: make(map[string]func(*http.Server, *tls.Conn, http.Handler)),
+	ln, err := net.Listen("tcp4", addr)
+	if err != nil {
+		log.Error().Err(err).Str("addr", addr).Msg("NVHTTP HTTPS: failed to listen")
+		return
 	}
+	defer ln.Close()
 
-	log.Info().Str("addr", addr).Msg("NVHTTP HTTPS server listening")
-	// ListenAndServeTLS("","") uses the certificates already set in TLSConfig.
-	if err := srv.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
-		log.Error().Err(err).Msg("NVHTTP HTTPS server error")
+	handler := s.nvhttpMux()
+
+	log.Info().Str("addr", addr).Msg("NVHTTP HTTPS server listening (TLS + plain HTTP)")
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			if s.ctx.Err() != nil {
+				return
+			}
+			log.Warn().Err(err).Msg("NVHTTP HTTPS: accept error")
+			continue
+		}
+		go s.handleDualConn(conn, tlsConfig, handler)
 	}
 }
+
+// handleDualConn peeks at the first byte of a connection to determine if it's
+// TLS (byte 0x16 = TLS handshake record) or plain HTTP, then serves accordingly.
+func (s *Server) handleDualConn(conn net.Conn, tlsConfig *tls.Config, handler http.Handler) {
+	defer conn.Close()
+
+	// Peek at the first byte without consuming it.
+	buf := make([]byte, 1)
+	n, err := conn.Read(buf)
+	if err != nil || n == 0 {
+		log.Debug().Err(err).Msg("NVHTTP HTTPS: failed to peek first byte")
+		return
+	}
+
+	// Wrap the connection so the peeked byte is replayed.
+	peeked := &prefixConn{prefix: buf[:n], Conn: conn}
+
+	if buf[0] == 0x16 {
+		// TLS ClientHello record type
+		log.Debug().Str("remote", conn.RemoteAddr().String()).Msg("NVHTTP HTTPS: TLS connection detected")
+		tlsConn := tls.Server(peeked, tlsConfig)
+		defer tlsConn.Close()
+		if err := tlsConn.Handshake(); err != nil {
+			log.Warn().Err(err).Str("remote", conn.RemoteAddr().String()).Msg("NVHTTP HTTPS: TLS handshake failed")
+			return
+		}
+		// Serve HTTP over the TLS connection.
+		srv := &http.Server{Handler: handler}
+		srv.ConnState = func(_ net.Conn, _ http.ConnState) {} // no-op
+		_ = http.Serve(newSingleConnListener(tlsConn), handler)
+	} else {
+		// Plain HTTP
+		log.Debug().Str("remote", conn.RemoteAddr().String()).Msg("NVHTTP HTTPS: plain HTTP connection detected")
+		_ = http.Serve(newSingleConnListener(peeked), handler)
+	}
+}
+
+// prefixConn replays prefix bytes before reading from the underlying connection.
+type prefixConn struct {
+	prefix []byte
+	net.Conn
+}
+
+func (c *prefixConn) Read(b []byte) (int, error) {
+	if len(c.prefix) > 0 {
+		n := copy(b, c.prefix)
+		c.prefix = c.prefix[n:]
+		return n, nil
+	}
+	return c.Conn.Read(b)
+}
+
+// singleConnListener is a net.Listener that returns a single connection then EOF.
+type singleConnListener struct {
+	conn net.Conn
+	addr net.Addr
+	done bool
+}
+
+func newSingleConnListener(c net.Conn) *singleConnListener {
+	return &singleConnListener{conn: c, addr: c.LocalAddr()}
+}
+
+func (l *singleConnListener) Accept() (net.Conn, error) {
+	if !l.done {
+		l.done = true
+		return l.conn, nil
+	}
+	return nil, fmt.Errorf("listener closed")
+}
+
+func (l *singleConnListener) Close() error   { return nil }
+func (l *singleConnListener) Addr() net.Addr { return l.addr }
 
 // ── /serverinfo ───────────────────────────────────────────────────────────────
 
