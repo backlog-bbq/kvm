@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -734,13 +735,52 @@ func (s *Server) handleAppList(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleLaunch(w http.ResponseWriter, r *http.Request) {
-	uniqueID := r.URL.Query().Get("uniqueid")
-	log.Info().Str("uniqueID", uniqueID).Str("remote", r.RemoteAddr).Msg("/launch")
+	q := r.URL.Query()
+	uniqueID := q.Get("uniqueid")
+	log.Info().
+		Str("uniqueID", uniqueID).
+		Str("remote", r.RemoteAddr).
+		Str("rikey", q.Get("rikey")).
+		Str("rikeyid", q.Get("rikeyid")).
+		Str("mode", q.Get("mode")).
+		Msg("/launch")
 	if uniqueID == "" || !s.store.IsPaired(uniqueID) {
 		log.Warn().Str("uniqueID", uniqueID).Msg("/launch: not paired")
 		xmlError(w, 403, "not paired")
 		return
 	}
+
+	// Extract session encryption keys from launch parameters.
+	// The Moonlight client sends rikey (AES-128 key, hex) and rikeyid
+	// as query parameters in the /launch request.
+	rikeyHex := q.Get("rikey")
+	rikeyidStr := q.Get("rikeyid")
+	if rikeyHex != "" && rikeyidStr != "" {
+		rikey, err := hex.DecodeString(rikeyHex)
+		if err == nil && len(rikey) == 16 {
+			rikeyID, err := strconv.ParseUint(rikeyidStr, 10, 32)
+			if err == nil {
+				// Derive GCM IV from rikeyid (big-endian, 12 bytes, zero-padded).
+				gcmIV := make([]byte, 12)
+				gcmIV[0] = byte(rikeyID >> 24)
+				gcmIV[1] = byte(rikeyID >> 16)
+				gcmIV[2] = byte(rikeyID >> 8)
+				gcmIV[3] = byte(rikeyID)
+
+				s.mu.Lock()
+				s.pendingRIKey = rikey
+				s.pendingRIKeyID = uint32(rikeyID)
+				s.pendingGCMIV = gcmIV
+				s.mu.Unlock()
+
+				log.Info().
+					Str("uniqueID", uniqueID).
+					Uint64("rikeyID", rikeyID).
+					Msg("/launch: session keys stored")
+			}
+		}
+	}
+
 	xmlOK(w, fmt.Sprintf(`<sessionUrl0>rtsp://%s:%d</sessionUrl0><gamesession>1</gamesession>`,
 		getOutboundIP(), RTSPPort))
 }

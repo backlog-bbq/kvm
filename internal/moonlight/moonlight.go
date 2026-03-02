@@ -76,6 +76,12 @@ type Server struct {
 	// activeSession is set when a Moonlight client has launched a stream.
 	activeSession *Session
 
+	// pendingRIKey/pendingRIKeyID/pendingGCMIV are set by /launch and consumed
+	// when the RTSP PLAY creates the active session.
+	pendingRIKey   []byte
+	pendingRIKeyID uint32
+	pendingGCMIV   []byte
+
 	// videoFrameCh buffers incoming H.264 frames from the capture pipeline.
 	videoFrameCh chan videoFrame
 }

@@ -3,8 +3,8 @@ package moonlight
 import (
 	"bufio"
 	"context"
-	"encoding/hex"
 	"fmt"
+	"io"
 	"net"
 	"strconv"
 	"strings"
@@ -15,7 +15,7 @@ import (
 // exchange the AES session key (rikey/rikeyid) used by the control channel.
 func (s *Server) runRTSPServer() {
 	addr := fmt.Sprintf(":%d", RTSPPort)
-	ln, err := net.Listen("tcp", addr)
+	ln, err := net.Listen("tcp4", addr)
 	if err != nil {
 		log.Error().Err(err).Str("addr", addr).Msg("failed to listen for RTSP")
 		return
@@ -83,22 +83,26 @@ func (s *Server) handleRTSPConn(conn net.Conn) {
 // the complete response string (including CRLF line endings per RFC 2326).
 func (s *Server) dispatchRTSP(req *rtspRequest, clientIP net.IP) string {
 	cseq := req.headers["CSeq"]
-	log.Debug().Str("method", req.method).Str("uri", req.uri).Msg("RTSP request")
+	log.Info().
+		Str("method", req.method).
+		Str("uri", req.uri).
+		Int("bodyLen", len(req.body)).
+		Msg("RTSP request")
 
 	switch req.method {
 	case "OPTIONS":
 		return rtspResponse(200, "OK", cseq, map[string]string{
-			"Public": "OPTIONS,DESCRIBE,SETUP,ANNOUNCE,PLAY,PAUSE,TEARDOWN",
+			"Public": "OPTIONS, DESCRIBE, SETUP, ANNOUNCE, PLAY, PAUSE, TEARDOWN",
 		}, "")
 
 	case "DESCRIBE":
 		return s.handleRTSPDescribe(cseq, clientIP)
 
 	case "SETUP":
-		return rtspResponse(200, "OK", cseq, map[string]string{
-			"Session":   "JETKVM_SESSION",
-			"Transport": req.headers["Transport"],
-		}, "")
+		return s.handleRTSPSetup(req, cseq)
+
+	case "ANNOUNCE":
+		return s.handleRTSPAnnounce(req, cseq, clientIP)
 
 	case "PLAY":
 		return s.handleRTSPPlay(req, cseq, clientIP)
@@ -108,6 +112,7 @@ func (s *Server) dispatchRTSP(req *rtspRequest, clientIP net.IP) string {
 		return rtspResponse(200, "OK", cseq, nil, "")
 
 	default:
+		log.Warn().Str("method", req.method).Msg("RTSP: unknown method")
 		return rtspResponse(501, "Not Implemented", cseq, nil, "")
 	}
 }
@@ -120,16 +125,17 @@ func (s *Server) handleRTSPDescribe(cseq string, clientIP net.IP) string {
 		"o=- 0 0 IN IP4 %s\r\n"+
 		"s=JetKVM\r\n"+
 		"t=0 0\r\n"+
+		"a=x-ss-general.featureFlags:0\r\n"+
 		// Video track: H.264 at 90kHz clock
 		"m=video %d RTP/AVP 96\r\n"+
 		"a=rtpmap:96 H264/90000\r\n"+
 		"a=fmtp:96 packetization-mode=1\r\n"+
-		"a=control:streamid=0\r\n"+
+		"a=control:streamid=video\r\n"+
 		// Audio track: Opus stereo at 48kHz
 		"m=audio %d RTP/AVP 97\r\n"+
-		"a=rtpmap:97 OPUS/48000/2\r\n"+
-		"a=fmtp:97 minptime=10;useinbandfec=1\r\n"+
-		"a=control:streamid=1\r\n",
+		"a=rtpmap:97 opus/48000/2\r\n"+
+		"a=fmtp:97 surround-params=5210200\r\n"+
+		"a=control:streamid=audio\r\n",
 		localIP,
 		VideoPort,
 		AudioPort,
@@ -141,42 +147,70 @@ func (s *Server) handleRTSPDescribe(cseq string, clientIP net.IP) string {
 	return rtspResponse(200, "OK", cseq, headers, sdp)
 }
 
-// handleRTSPPlay extracts session keys and client port info from the PLAY request,
-// creates a new Session, and begins streaming.
-//
-// The Moonlight client embeds the AES key in the X-RtspSessionInfo header:
-//
-//	X-RtspSessionInfo: <rikey_hex>;<rikeyid>;<gcmiv_hex>
-func (s *Server) handleRTSPPlay(req *rtspRequest, cseq string, clientIP net.IP) string {
-	sessionInfo := req.headers["X-RtspSessionInfo"]
-	rikey, rikeyID, gcmIV, err := parseSessionInfo(sessionInfo)
-	if err != nil {
-		log.Warn().Err(err).Str("header", sessionInfo).Msg("failed to parse X-RtspSessionInfo")
-		return rtspResponse(400, "Bad Request", cseq, nil, "")
+// handleRTSPSetup handles stream SETUP requests (audio, video, control).
+// Returns the server port for the requested stream type and a session ID.
+func (s *Server) handleRTSPSetup(req *rtspRequest, cseq string) string {
+	// Determine stream type from the URI (e.g., "streamid=audio" or "streamid=video").
+	uri := req.uri
+	var port int
+	switch {
+	case strings.Contains(uri, "streamid=audio") || strings.Contains(uri, "streamid=1"):
+		port = AudioPort
+	case strings.Contains(uri, "streamid=video") || strings.Contains(uri, "streamid=0"):
+		port = VideoPort
+	case strings.Contains(uri, "streamid=control") || strings.Contains(uri, "streamid=2"):
+		port = ControlPort
+	default:
+		port = VideoPort
 	}
 
-	// Parse client address from X-GS-ClientAddress.
-	clientAddrStr := req.headers["X-GS-ClientAddress"]
-	clientVideoPort := uint16(VideoPort)
-	clientAudioPort := uint16(AudioPort)
-	clientControlPort := uint16(ControlPort)
+	log.Info().
+		Str("uri", uri).
+		Int("server_port", port).
+		Msg("RTSP SETUP")
 
-	if clientAddrStr != "" {
-		if _, portStr, err := net.SplitHostPort(clientAddrStr); err == nil {
-			if port, err := strconv.ParseUint(portStr, 10, 16); err == nil {
-				clientVideoPort = uint16(port)
-				clientAudioPort = uint16(port) + 2
-				clientControlPort = uint16(port) + 1
-			}
-		}
+	return rtspResponse(200, "OK", cseq, map[string]string{
+		"Session":   "DEADBEEFCAFE;timeout = 90",
+		"Transport": fmt.Sprintf("server_port=%d", port),
+	}, "")
+}
+
+// handleRTSPAnnounce processes the client's ANNOUNCE request which contains
+// the SDP describing the client's desired stream configuration.
+// We parse key parameters and return 200 OK.
+func (s *Server) handleRTSPAnnounce(req *rtspRequest, cseq string, clientIP net.IP) string {
+	log.Info().
+		Str("remote", clientIP.String()).
+		Int("bodyLen", len(req.body)).
+		Msg("RTSP ANNOUNCE")
+
+	if req.body != "" {
+		log.Debug().Str("sdp", req.body).Msg("RTSP ANNOUNCE SDP")
+	}
+
+	return rtspResponse(200, "OK", cseq, nil, "")
+}
+
+// handleRTSPPlay signals the start of the streaming session.
+// Session keys (rikey, rikeyid) were already extracted from the /launch HTTP request.
+func (s *Server) handleRTSPPlay(req *rtspRequest, cseq string, clientIP net.IP) string {
+	s.mu.Lock()
+	rikey := s.pendingRIKey
+	rikeyID := s.pendingRIKeyID
+	gcmIV := s.pendingGCMIV
+	s.mu.Unlock()
+
+	if len(rikey) == 0 {
+		log.Warn().Msg("RTSP PLAY: no rikey available (was /launch called?)")
+		return rtspResponse(400, "Bad Request", cseq, nil, "")
 	}
 
 	ctx, cancel := context.WithCancel(s.ctx)
 	sess := &Session{
 		ClientIP:    clientIP,
-		VideoPort:   clientVideoPort,
-		AudioPort:   clientAudioPort,
-		ControlPort: clientControlPort,
+		VideoPort:   uint16(VideoPort),
+		AudioPort:   uint16(AudioPort),
+		ControlPort: uint16(ControlPort),
 		RIKey:       rikey,
 		RIKeyID:     rikeyID,
 		GCMIV:       gcmIV,
@@ -187,54 +221,12 @@ func (s *Server) handleRTSPPlay(req *rtspRequest, cseq string, clientIP net.IP) 
 
 	log.Info().
 		Str("clientIP", clientIP.String()).
-		Uint16("videoPort", clientVideoPort).
 		Uint32("rikeyID", rikeyID).
 		Msg("RTSP PLAY: session started")
 
 	return rtspResponse(200, "OK", cseq, map[string]string{
-		"Session": "JETKVM_SESSION",
+		"Session": "DEADBEEFCAFE;timeout = 90",
 	}, "")
-}
-
-// parseSessionInfo parses the X-RtspSessionInfo header value.
-// Format: <rikey_hex>;<rikeyid_decimal>;<gcmiv_hex>
-func parseSessionInfo(info string) (rikey []byte, rikeyID uint32, gcmIV []byte, err error) {
-	if info == "" {
-		return nil, 0, nil, fmt.Errorf("empty X-RtspSessionInfo")
-	}
-	parts := strings.Split(info, ";")
-	if len(parts) < 2 {
-		return nil, 0, nil, fmt.Errorf("malformed X-RtspSessionInfo: %q", info)
-	}
-
-	rikey, err = hex.DecodeString(parts[0])
-	if err != nil || len(rikey) != 16 {
-		return nil, 0, nil, fmt.Errorf("invalid rikey: %q", parts[0])
-	}
-
-	id, err := strconv.ParseUint(parts[1], 10, 32)
-	if err != nil {
-		return nil, 0, nil, fmt.Errorf("invalid rikeyid: %q", parts[1])
-	}
-	rikeyID = uint32(id)
-
-	// GCM IV is optional in older clients.
-	if len(parts) >= 3 && parts[2] != "" {
-		gcmIV, err = hex.DecodeString(parts[2])
-		if err != nil {
-			return nil, 0, nil, fmt.Errorf("invalid gcmiv: %q", parts[2])
-		}
-	}
-	if len(gcmIV) == 0 {
-		// Derive a 12-byte IV from rikeyID.
-		gcmIV = make([]byte, 12)
-		gcmIV[0] = byte(rikeyID >> 24)
-		gcmIV[1] = byte(rikeyID >> 16)
-		gcmIV[2] = byte(rikeyID >> 8)
-		gcmIV[3] = byte(rikeyID)
-	}
-
-	return rikey, rikeyID, gcmIV, nil
 }
 
 // rtspResponse formats a complete RTSP response with the given status, CSeq, optional
@@ -307,7 +299,7 @@ func readRTSPRequest(r *bufio.Reader) (*rtspRequest, error) {
 		n, err := strconv.Atoi(cl)
 		if err == nil && n > 0 {
 			buf := make([]byte, n)
-			if _, err := r.Read(buf); err != nil {
+			if _, err := io.ReadFull(r, buf); err != nil {
 				return nil, err
 			}
 			req.body = string(buf)
