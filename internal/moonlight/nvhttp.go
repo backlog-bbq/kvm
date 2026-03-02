@@ -127,7 +127,12 @@ func (s *Server) runNVHTTPSServer() {
 
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{tlsCert},
-		MinVersion:   tls.VersionTLS12,
+		MinVersion:   tls.VersionTLS10,
+		// Moonlight clients present their paired certificate during TLS handshake.
+		// RequestClientCert asks for a cert but doesn't require/verify it at the
+		// TLS layer — verification is done at the application level via IsPaired().
+		// Without this, Moonlight resets the connection during handshake.
+		ClientAuth: tls.RequestClientCert,
 	}
 
 	addr := fmt.Sprintf(":%d", NVHTTPSPort)
