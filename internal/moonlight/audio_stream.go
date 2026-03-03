@@ -83,7 +83,7 @@ func (s *Server) runAudioStream() {
 				log.Info().Str("dest", dest).Msg("audio RTP stream connected")
 			}
 
-			payload, err := encryptAudioPayload(opusSilenceFrame, sess.RIKey, seq)
+			payload, err := encryptAudioPayload(opusSilenceFrame, sess.RIKey, sess.RIKeyID, seq)
 			if err != nil {
 				log.Warn().Err(err).Msg("audio encryption error")
 				seq++
@@ -117,11 +117,11 @@ func openAudioUDP(dest string) (*net.UDPConn, error) {
 
 // encryptAudioPayload encrypts an Opus frame with AES-128-CBC.
 //
-// The Moonlight audio encryption scheme:
+// The Moonlight audio encryption scheme (per moonlight-common-c/src/AudioStream.c):
 //   - Key: rikey (16 bytes, from RTSP)
-//   - IV: sequence number (2 bytes, big-endian) padded to 16 bytes with zeros
+//   - IV: BigEndian(rikeyID + sequenceNumber) in first 4 bytes, remaining 12 bytes zero
 //   - Mode: CBC, zero-padded plaintext to block boundary
-func encryptAudioPayload(frame, rikey []byte, seq uint16) ([]byte, error) {
+func encryptAudioPayload(frame, rikey []byte, rikeyID uint32, seq uint16) ([]byte, error) {
 	if len(rikey) != 16 {
 		// No key set (pre-pairing); send unencrypted.
 		return frame, nil
@@ -140,9 +140,9 @@ func encryptAudioPayload(frame, rikey []byte, seq uint16) ([]byte, error) {
 	plaintext := make([]byte, len(frame)+padLen)
 	copy(plaintext, frame)
 
-	// IV = seq (2 bytes BE) + 14 zero bytes.
+	// IV = BigEndian(rikeyID + uint32(seq)) + 12 zero bytes.
 	iv := make([]byte, aes.BlockSize)
-	binary.BigEndian.PutUint16(iv[0:2], seq)
+	binary.BigEndian.PutUint32(iv[0:4], rikeyID+uint32(seq))
 
 	ciphertext := make([]byte, len(plaintext))
 	cipher.NewCBCEncrypter(block, iv).CryptBlocks(ciphertext, plaintext)

@@ -59,12 +59,15 @@ const enetFlagAcknowledge = 0x80
 
 // Moonlight control message type identifiers (little-endian uint16).
 const (
-	msgMouseMoveRel = 0x0206
-	msgMouseButton  = 0x0507
-	msgMouseMoveAbs = 0x0510
-	msgKeyboard     = 0x0307
-	msgScroll       = 0x0509
-	msgScrollV2     = 0x0115
+	msgMouseMoveRel    = 0x0206
+	msgMouseButton     = 0x0507
+	msgMouseMoveAbs    = 0x0510
+	msgKeyboard        = 0x0307
+	msgScroll          = 0x0509
+	msgScrollV2        = 0x0115
+	msgRequestIDRFrame = 0x0302
+	msgInvalidateRef   = 0x0301
+	msgStartA          = 0x0305
 )
 
 // Mouse button bit-flags used by Moonlight (maps to USB HID button order).
@@ -89,12 +92,11 @@ func (s *Server) runControlStream() {
 
 	// enetState tracks per-peer connection state.
 	type enetPeer struct {
-		addr       *net.UDPAddr
-		peerID     uint16 // the client's outgoing peer ID (we put this in our headers)
-		myPeerID   uint16 // our peer ID (random, sent in VERIFY_CONNECT)
-		connected  bool
-		outSeqNum  uint16
-		inSeqNum   uint16
+		addr      *net.UDPAddr
+		peerID    uint16 // the client's outgoing peer ID (we put this in our headers)
+		connected bool
+		outSeqNum uint16
+		inSeqNum  uint16
 	}
 
 	var peer *enetPeer
@@ -178,12 +180,11 @@ func (s *Server) runControlStream() {
 				peer = &enetPeer{
 					addr:      udpAddr,
 					peerID:    outgoingPeerID,
-					myPeerID:  0x0001,
 					connected: false,
 				}
 
 				// Send ACK for the CONNECT.
-				ack := buildENetAck(peer.peerID, peer.myPeerID, relSeqNum, sentTime)
+				ack := buildENetAck(peer.peerID, relSeqNum, sentTime)
 				_, _ = pc.WriteTo(ack, udpAddr)
 
 				// Send VERIFY_CONNECT.
@@ -214,7 +215,7 @@ func (s *Server) runControlStream() {
 				}
 
 				// Send ACK.
-				ack := buildENetAck(peer.peerID, peer.myPeerID, relSeqNum, sentTime)
+				ack := buildENetAck(peer.peerID, relSeqNum, sentTime)
 				_, _ = pc.WriteTo(ack, udpAddr)
 
 				// Decrypt and dispatch the Moonlight control message.
@@ -237,7 +238,7 @@ func (s *Server) runControlStream() {
 			case enetCmdPing:
 				// Reply with ACK; no payload.
 				if peer != nil {
-					ack := buildENetAck(peer.peerID, peer.myPeerID, relSeqNum, sentTime)
+					ack := buildENetAck(peer.peerID, relSeqNum, sentTime)
 					_, _ = pc.WriteTo(ack, udpAddr)
 				}
 
@@ -259,38 +260,42 @@ func (s *Server) runControlStream() {
 
 // decryptControlPayload decrypts an AES-GCM-128 encrypted Moonlight control payload.
 //
-// Wire format (from moonlight-common-c/src/Control.c):
+// Wire format (per moonlight-common-c/src/ControlStream.c NVCTL_ENCRYPTED_PACKET):
 //
-//	[4 bytes: sequence number, big-endian]
-//	[ciphertext]
-//	[16 bytes: GCM authentication tag, appended at end]
+//	NVCTL_ENCRYPTED_PACKET_HEADER (8 bytes):
+//	  [2B encryptedHeaderType LE] = 0x0001
+//	  [2B length LE]              = length of remaining data (seq + tag + ciphertext)
+//	  [4B seq LE]                 = monotonically increasing sequence number
+//	[16B GCM authentication tag]
+//	[ciphertext]                  = encrypted NVCTL_ENET_PACKET_HEADER_V2 + payload
 //
-// Nonce: rikeyID (4 bytes, big-endian) padded to 12 bytes
+// GCM nonce (12 bytes, per SS_ENC_CONTROL_V2):
+//
+//	nonce[0:4]  = seqNum (little-endian)
+//	nonce[4:10] = zeros
+//	nonce[10]   = 0x43 ('C' = client-originated)
+//	nonce[11]   = 0x43 ('C' = control stream)
 func decryptControlPayload(data []byte, sess *Session) ([]byte, error) {
 	if len(sess.RIKey) != 16 {
-		// No key; pass through for debugging (should not happen in production).
 		return data, nil
 	}
 
-	if len(data) < 4+16 {
+	// Minimum: 8 (header) + 16 (tag) + 0 (ciphertext) = 24 bytes.
+	if len(data) < 24 {
 		return nil, fmt.Errorf("moonlight: control payload too short (%d bytes)", len(data))
 	}
 
-	// Extract sequence number (used to construct the nonce).
-	seqNum := binary.BigEndian.Uint32(data[0:4])
-	ciphertextAndTag := data[4:]
+	// Parse NVCTL_ENCRYPTED_PACKET_HEADER (8 bytes).
+	// Skip encryptedHeaderType (2B) and length (2B).
+	seqNum := binary.LittleEndian.Uint32(data[4:8])
 
-	// Split ciphertext and 16-byte GCM tag.
-	if len(ciphertextAndTag) < 16 {
-		return nil, fmt.Errorf("moonlight: control payload too short for GCM tag")
-	}
-	ciphertext := ciphertextAndTag[:len(ciphertextAndTag)-16]
-	tag := ciphertextAndTag[len(ciphertextAndTag)-16:]
+	// GCM tag is immediately after the 8-byte header.
+	tag := data[8:24]
+	// Ciphertext follows the tag.
+	ciphertext := data[24:]
 
-	// Nonce: rikeyID (4 bytes BE) + seqNum (4 bytes BE) + 4 zero bytes.
-	nonce := make([]byte, 12)
-	binary.BigEndian.PutUint32(nonce[0:4], sess.RIKeyID)
-	binary.BigEndian.PutUint32(nonce[4:8], seqNum)
+	// Build GCM nonce per SS_ENC_CONTROL_V2.
+	nonce := buildControlGCMNonce(seqNum)
 
 	block, err := aes.NewCipher(sess.RIKey)
 	if err != nil {
@@ -307,25 +312,56 @@ func decryptControlPayload(data []byte, sess *Session) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("moonlight: GCM decrypt: %w", err)
 	}
-	return plaintext, nil
+
+	// The plaintext starts with NVCTL_ENET_PACKET_HEADER_V2:
+	//   [2B type LE]          = the message type
+	//   [2B payloadLength LE] = length of payload after this header
+	// We keep the type prefix but strip the payloadLength, so the result is
+	// [2B type LE][payload...] matching what dispatchControlMessage expects.
+	if len(plaintext) < 4 {
+		return nil, fmt.Errorf("moonlight: decrypted control payload too short for V2 header (%d bytes)", len(plaintext))
+	}
+	// Rebuild as [type(2B)][payload after V2 header]
+	result := make([]byte, 0, 2+len(plaintext)-4)
+	result = append(result, plaintext[0:2]...) // type
+	result = append(result, plaintext[4:]...)   // payload (skip payloadLength)
+	return result, nil
+}
+
+// buildControlGCMNonce constructs the 12-byte GCM nonce for control stream
+// decryption per the SS_ENC_CONTROL_V2 scheme used by Sunshine/Moonlight.
+func buildControlGCMNonce(seqNum uint32) []byte {
+	nonce := make([]byte, 12)
+	binary.LittleEndian.PutUint32(nonce[0:4], seqNum)
+	// nonce[4:10] = zeros
+	nonce[10] = 0x43 // 'C' = client-originated
+	nonce[11] = 0x43 // 'C' = control stream
+	return nonce
 }
 
 // dispatchControlMessage parses a decrypted Moonlight input message and routes
 // it to the appropriate HID callback.
+//
+// After V2 header stripping in decryptControlPayload, the data format is:
+//
+//	[2B type LE][payload...]
+//
+// where payload is the message-specific fields (no padding between type and payload).
 func (s *Server) dispatchControlMessage(data []byte, sess *Session) {
 	if len(data) < 2 {
 		return
 	}
 	msgType := binary.LittleEndian.Uint16(data[0:2])
+	payload := data[2:] // message-specific fields after the type
 
 	switch msgType {
 	case msgMouseMoveRel:
-		// [2 type][2 zero][4 dx int32 BE][4 dy int32 BE]
-		if len(data) < 12 {
+		// payload: [4 dx int32 BE][4 dy int32 BE]
+		if len(payload) < 8 {
 			return
 		}
-		dx32 := int32(binary.BigEndian.Uint32(data[4:8]))
-		dy32 := int32(binary.BigEndian.Uint32(data[8:12]))
+		dx32 := int32(binary.BigEndian.Uint32(payload[0:4]))
+		dy32 := int32(binary.BigEndian.Uint32(payload[4:8]))
 		dx := clampInt8(dx32)
 		dy := clampInt8(dy32)
 		if s.cfg.HID.RelMouseMove != nil {
@@ -335,12 +371,12 @@ func (s *Server) dispatchControlMessage(data []byte, sess *Session) {
 		}
 
 	case msgMouseMoveAbs:
-		// [2 type][2 zero][2 x uint16][2 y uint16][2 width][2 height]
-		if len(data) < 12 {
+		// payload: [2 x uint16 BE][2 y uint16 BE][2 width][2 height]
+		if len(payload) < 8 {
 			return
 		}
-		x := int(binary.BigEndian.Uint16(data[4:6]))
-		y := int(binary.BigEndian.Uint16(data[6:8]))
+		x := int(binary.BigEndian.Uint16(payload[0:2]))
+		y := int(binary.BigEndian.Uint16(payload[2:4]))
 		// Moonlight coordinates are 0–65535; map to 0–32767 for HID.
 		x = x >> 1
 		y = y >> 1
@@ -351,13 +387,13 @@ func (s *Server) dispatchControlMessage(data []byte, sess *Session) {
 		}
 
 	case msgMouseButton:
-		// [2 type][2 zero][1 buttonFlags][1 action]
+		// payload: [1 buttonFlags][1 action]
 		// action: 0x07 = press, 0x08 = release
-		if len(data) < 6 {
+		if len(payload) < 2 {
 			return
 		}
-		btnFlags := data[4]
-		action := data[5]
+		btnFlags := payload[0]
+		action := payload[1]
 
 		hidBtn := mlToHIDButtons(btnFlags)
 		if action == 0x07 {
@@ -372,13 +408,13 @@ func (s *Server) dispatchControlMessage(data []byte, sess *Session) {
 		}
 
 	case msgKeyboard:
-		// [2 type][1 action][1 zero][2 keyCode LE][1 modifiers][1 zero]
-		if len(data) < 8 {
+		// payload: [1 action][1 zero][2 keyCode LE][1 modifiers][1 zero]
+		if len(payload) < 6 {
 			return
 		}
-		action := data[2]    // 0x03 = down, 0x04 = up
-		vkCode := binary.LittleEndian.Uint16(data[4:6])
-		winMods := data[6]
+		action := payload[0]  // 0x03 = down, 0x04 = up
+		vkCode := binary.LittleEndian.Uint16(payload[2:4])
+		winMods := payload[4]
 
 		hidKey := vkToHID(vkCode)
 		if hidKey == 0 {
@@ -405,11 +441,11 @@ func (s *Server) dispatchControlMessage(data []byte, sess *Session) {
 		}
 
 	case msgScroll, msgScrollV2:
-		// [2 type][2 zero][2 scrollAmt int16 BE]
-		if len(data) < 6 {
+		// payload: [2 scrollAmt int16 BE]
+		if len(payload) < 2 {
 			return
 		}
-		scrollAmt := int16(binary.BigEndian.Uint16(data[4:6]))
+		scrollAmt := int16(binary.BigEndian.Uint16(payload[0:2]))
 		dy := int8(clampScrollInt8(int32(scrollAmt)))
 		if s.cfg.HID.Scroll != nil {
 			if err := s.cfg.HID.Scroll(dy); err != nil {
@@ -417,8 +453,18 @@ func (s *Server) dispatchControlMessage(data []byte, sess *Session) {
 			}
 		}
 
+	case msgRequestIDRFrame, msgInvalidateRef:
+		log.Debug().Uint16("type", msgType).Msg("IDR frame request received")
+		if s.cfg.RequestIDR != nil {
+			s.cfg.RequestIDR()
+		}
+
+	case msgStartA:
+		log.Debug().Msg("control START_A received (handshake)")
+		// Handshake message — ACK is already sent by the ENet layer.
+
 	default:
-		log.Debug().Uint16("type", msgType).Msg("unknown Moonlight control message")
+		log.Debug().Uint16("type", msgType).Int("len", len(data)).Msg("unknown Moonlight control message")
 	}
 }
 
@@ -699,7 +745,7 @@ func vkToHID(vk uint16) byte {
 }
 
 // buildENetAck constructs an ENet ACKNOWLEDGE datagram.
-func buildENetAck(remotePeerID, myPeerID, rcvSeqNum, rcvSentTime uint16) []byte {
+func buildENetAck(remotePeerID, rcvSeqNum, rcvSentTime uint16) []byte {
 	buf := make([]byte, 12) // 4-byte header + 4-byte command header + 4-byte ack payload
 	// Protocol header: peerID with SENT_TIME flag, sentTime
 	now := uint16(time.Now().UnixMilli() & 0xFFFF)
@@ -712,7 +758,6 @@ func buildENetAck(remotePeerID, myPeerID, rcvSeqNum, rcvSentTime uint16) []byte 
 	// ACK payload: received seq + received sentTime
 	binary.BigEndian.PutUint16(buf[8:10], rcvSeqNum)
 	binary.BigEndian.PutUint16(buf[10:12], rcvSentTime)
-	_ = myPeerID
 	return buf
 }
 

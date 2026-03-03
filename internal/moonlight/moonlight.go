@@ -57,6 +57,10 @@ type ServerConfig struct {
 	// client. The callback receives the connecting device name and its unique ID
 	// (which must be passed back to SubmitPIN).
 	PINCallback func(deviceName, uniqueID string)
+	// RequestIDR is called when a Moonlight client requests an IDR (keyframe).
+	// The implementation should signal the video encoder to produce a keyframe
+	// on the next frame. May be nil if not supported.
+	RequestIDR func()
 }
 
 // videoFrame holds a single H.264 video frame for delivery to the RTP sender.
